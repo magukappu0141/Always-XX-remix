@@ -688,7 +688,7 @@ input[type="color"] {
   color: var(--color-ink);
 }
 
-.trace-preview__box svg { width: 100%; max-height: 220px; }
+.trace-preview__box svg { width: auto; height: auto; max-width: 100%; max-height: 220px; }
 
 .trace-preview__count {
   margin: 0 var(--space-sm);
@@ -863,4 +863,30 @@ input[type="color"] {
 .lang-switch__btn.is-active {
   background: var(--color-primary);
   color: #fff;
+}
+
+/* Like button on gallery cards */
+
+.gallery-card__like {
+  margin-top: 2px;
+  padding: 3px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-canvas);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-ink-soft);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: color var(--duration-fast), border-color var(--duration-fast);
+}
+
+.gallery-card__like:hover { border-color: var(--color-clear-ink); }
+.gallery-card__like:disabled { opacity: 0.6; cursor: default; }
+
+.gallery-card__like.is-liked {
+  color: var(--color-clear-ink);
+  border-color: var(--color-clear-ink);
+  background: var(--color-clear-bg);
 }

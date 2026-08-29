@@ -63,6 +63,15 @@ export function expandBox(box, minAspect, shapeAspect) {
   return { minX: cx - w / 2, minY: cy - h / 2, width: w, height: h };
 }
 
+// Scale a box vertically about its own centre, so the shape grows or shrinks
+// in height without drifting away from where the stroke was drawn.
+export function scaleBoxHeight(box, factor) {
+  if (!(factor > 0) || factor === 1) return box;
+  const height = box.height * factor;
+  const cy = box.minY + box.height / 2;
+  return { ...box, minY: cy - height / 2, height };
+}
+
 // Map points into 0..1 relative to `box`.
 export function normalize(points, box) {
   const b = box ?? getBounds(points);

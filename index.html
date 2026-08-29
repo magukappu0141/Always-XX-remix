@@ -111,6 +111,12 @@
             <path d="M12 2.5l2 6.5 6.5 2-6.5 2-2 6.5-2-6.5-6.5-2 6.5-2z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
           </svg>
         </button>
+        <button class="tool" id="tool-publish" type="button" disabled data-i18n-title="draw.publish" data-i18n-aria="draw.publish">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 16V4m0 0L8 8m4-4l4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
         <button class="tool" id="tool-save" type="button" disabled data-i18n-title="draw.save" data-i18n-aria="draw.save">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M12 3v11m0 0l-4-4m4 4l4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -177,6 +183,17 @@
               </div>
             </div>
             <p class="group__hint" data-i18n="settings.minAspectHint"></p>
+          </section>
+
+          <section class="group">
+            <h3 class="group__label" data-i18n="settings.heightScale"></h3>
+            <div class="group__card">
+              <div class="cell">
+                <input id="height-scale" class="slider" type="range" min="0.3" max="3" step="0.05">
+                <span class="cell__value" id="height-scale-value"></span>
+              </div>
+            </div>
+            <p class="group__hint" data-i18n="settings.heightScaleHint"></p>
           </section>
 
           <section class="group">

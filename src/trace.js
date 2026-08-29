@@ -1,12 +1,15 @@
 // Raster line art to SVG centrelines.
 // threshold -> thin to 1px -> walk the skeleton -> simplify.
 
-const MAX_DIMENSION = 640;
+const MAX_DIMENSION = 1000;
 const MIN_PATH_POINTS = 4;
-const MIN_PATH_LENGTH = 12;
+const MIN_PATH_LENGTH = 10;
+// Window radius for adaptive thresholding, as a fraction of the long edge.
+const ADAPTIVE_RADIUS_RATIO = 0.06;
 
 export const DEFAULT_TRACE_OPTIONS = {
-  // 0..1, or null to pick automatically with Otsu's method.
+  // 0..1 bias applied to the chosen threshold, or null to leave it alone.
+  // Positive picks up fainter lines, negative rejects more background.
   threshold: null,
   // RDP tolerance in pixels; higher means fewer, straighter points.
   simplify: 1.4,
@@ -14,6 +17,15 @@ export const DEFAULT_TRACE_OPTIONS = {
   minBranch: 8,
   // Set when the art is light strokes on a dark ground.
   invert: false,
+  // Local thresholding instead of one global cutoff. Handles photos of paper
+  // where one corner is shadowed and another is blown out.
+  adaptive: true,
+  // Remove connected blobs smaller than this many pixels before thinning,
+  // so paper grain and JPEG noise never become strokes.
+  despeckle: 12,
+  // Close gaps up to this many pixels across, for lines broken by a light
+  // pencil or by threshold noise.
+  closeGaps: 1,
 };
 
 export async function loadImage(file) {
@@ -99,6 +111,124 @@ function binarize(gray, width, height, threshold, invert) {
   for (let i = 0; i < gray.length; i++) {
     const dark = gray[i] <= threshold;
     mask[i] = (invert ? !dark : dark) ? 1 : 0;
+  }
+  return mask;
+}
+
+// Box blur via a summed-area table: O(pixels) regardless of window size.
+function localMean(gray, width, height, radius) {
+  const sums = new Float64Array((width + 1) * (height + 1));
+  for (let y = 0; y < height; y++) {
+    let rowSum = 0;
+    for (let x = 0; x < width; x++) {
+      rowSum += gray[y * width + x];
+      sums[(y + 1) * (width + 1) + (x + 1)] = sums[y * (width + 1) + (x + 1)] + rowSum;
+    }
+  }
+
+  const out = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    const y0 = Math.max(0, y - radius);
+    const y1 = Math.min(height - 1, y + radius);
+    for (let x = 0; x < width; x++) {
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width - 1, x + radius);
+      const total =
+        sums[(y1 + 1) * (width + 1) + (x1 + 1)] -
+        sums[y0 * (width + 1) + (x1 + 1)] -
+        sums[(y1 + 1) * (width + 1) + x0] +
+        sums[y0 * (width + 1) + x0];
+      out[y * width + x] = total / ((x1 - x0 + 1) * (y1 - y0 + 1));
+    }
+  }
+  return out;
+}
+
+// Ink is whatever sits meaningfully darker than its own neighbourhood, so
+// uneven lighting across a photo stops mattering. `bias` shifts how much
+// darker a pixel must be; `floor` keeps flat bright areas from turning to
+// noise, since with no ink nearby the local mean sits right at the paper.
+function binarizeAdaptive(gray, width, height, bias, invert, globalThreshold) {
+  const radius = Math.max(4, Math.round(Math.max(width, height) * ADAPTIVE_RADIUS_RATIO));
+  const mean = localMean(gray, width, height, radius);
+  const mask = new Uint8Array(width * height);
+  const margin = 0.04 - bias;
+
+  for (let i = 0; i < gray.length; i++) {
+    const value = invert ? 1 - gray[i] : gray[i];
+    const reference = invert ? 1 - mean[i] : mean[i];
+    // Two votes: locally darker than surroundings, and not obviously paper.
+    const local = value < reference - margin;
+    const global = value <= globalThreshold;
+    mask[i] = local && global ? 1 : 0;
+  }
+  return mask;
+}
+
+// Morphological closing: grow the ink, then shrink it back. Bridges hairline
+// breaks in a pencil line without fattening the overall shape.
+function closeGaps(mask, width, height, radius) {
+  if (radius <= 0) return mask;
+  const at = (m, x, y) => (x < 0 || y < 0 || x >= width || y >= height ? 0 : m[y * width + x]);
+
+  const pass = (src, want) => {
+    const dst = new Uint8Array(src.length);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let hit = 0;
+        for (let dy = -radius; dy <= radius && !hit; dy++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            if (at(src, x + dx, y + dy) === want) {
+              hit = 1;
+              break;
+            }
+          }
+        }
+        dst[y * width + x] = want === 1 ? hit : (hit ? 0 : 1);
+      }
+    }
+    return dst;
+  };
+
+  return pass(pass(mask, 1), 0);
+}
+
+// Drop connected components below `minPixels`, so grain and dust never reach
+// the skeletoniser. Iterative flood fill; recursion would blow the stack on
+// a large blob.
+function despeckle(mask, width, height, minPixels) {
+  if (minPixels <= 0) return mask;
+  const seen = new Uint8Array(mask.length);
+  const stack = [];
+
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || seen[start]) continue;
+
+    stack.length = 0;
+    stack.push(start);
+    seen[start] = 1;
+    const blob = [];
+
+    while (stack.length > 0) {
+      const index = stack.pop();
+      blob.push(index);
+      const x = index % width;
+      const y = (index / width) | 0;
+      for (const [dx, dy] of NEIGHBOURS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const ni = ny * width + nx;
+        if (mask[ni] && !seen[ni]) {
+          seen[ni] = 1;
+          stack.push(ni);
+        }
+      }
+    }
+
+    if (blob.length < minPixels) {
+      for (const index of blob) mask[index] = 0;
+    }
   }
   return mask;
 }
@@ -343,20 +473,52 @@ function polylineLength(points) {
  * Returns `{ paths, width, height, threshold }`.
  */
 export function traceImage(image, options = {}) {
-  const { threshold, simplify, minBranch, invert } = { ...DEFAULT_TRACE_OPTIONS, ...options };
+  const opts = { ...DEFAULT_TRACE_OPTIONS, ...options };
+  const { simplify, minBranch, invert, adaptive } = opts;
 
   const { gray, width, height } = toGrayscale(image);
-  const level = threshold ?? otsuThreshold(gray);
-  const mask = binarize(gray, width, height, level, invert);
+  const auto = otsuThreshold(gray);
+  // `threshold` is a slider position; treat it as an offset from the
+  // automatic choice so the control stays useful across very different
+  // images instead of meaning something new for each one.
+  const bias = opts.threshold === null ? 0 : opts.threshold - auto;
+  const level = Math.min(1, Math.max(0, auto + bias));
+
+  let mask = adaptive
+    ? binarizeAdaptive(gray, width, height, bias, invert, Math.min(1, level + 0.18))
+    : binarize(gray, width, height, level, invert);
+
+  mask = closeGaps(mask, width, height, opts.closeGaps);
+  despeckle(mask, width, height, opts.despeckle);
   thin(mask, width, height);
   pruneRedundant(mask, width, height);
 
-  const paths = traceSkeleton(mask, width, height)
+  const paths = pruneSpurs(traceSkeleton(mask, width, height), minBranch)
     .filter((line) => line.length >= MIN_PATH_POINTS && polylineLength(line) >= minBranch)
     .map((line) => simplifyPath(line, simplify))
     .filter((line) => line.length >= 2 && polylineLength(line) >= MIN_PATH_LENGTH);
 
   return { paths, width, height, threshold: level };
+}
+
+// Thinning leaves short whiskers where a stroke widens or two lines meet.
+// Drop the ones that dead-end, keeping anything that bridges two junctions.
+function pruneSpurs(paths, minBranch) {
+  const endpointKey = (p) => `${Math.round(p.x)},${Math.round(p.y)}`;
+  const degree = new Map();
+  for (const line of paths) {
+    for (const end of [line[0], line[line.length - 1]]) {
+      const key = endpointKey(end);
+      degree.set(key, (degree.get(key) ?? 0) + 1);
+    }
+  }
+
+  return paths.filter((line) => {
+    if (polylineLength(line) >= minBranch * 2) return true;
+    const startFree = (degree.get(endpointKey(line[0])) ?? 0) <= 1;
+    const endFree = (degree.get(endpointKey(line[line.length - 1])) ?? 0) <= 1;
+    return !(startFree || endFree);
+  });
 }
 
 // Serialise traced polylines as an SVG document.

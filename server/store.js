@@ -12,6 +12,17 @@ export const REPORTS_TO_HIDE = 3;
 // Refuse new submissions past this, so disk use stays bounded.
 export const MAX_SHAPES = 5000;
 
+// Liker hashes are kept per shape so a like can be taken back and cannot be
+// repeated. That is the one part of the index that grows with traffic rather
+// than with the number of shapes, so it is capped: past this many likers the
+// count still rises but repeat protection degrades to the client's own record.
+export const MAX_TRACKED_LIKERS = 2000;
+
+// A like is a deliberate vote; a use is incidental. Weight them accordingly.
+function popularity(shape) {
+  return (shape.likes ?? 0) * 3 + (shape.uses ?? 0);
+}
+
 export class Store {
   constructor(dataDir, secret) {
     this.dataDir = dataDir;
@@ -76,18 +87,25 @@ export class Store {
       themeColor: shape.themeColor,
       pathCount: shape.pathCount,
       uses: shape.uses,
+      likes: shape.likes ?? 0,
       createdAt: shape.createdAt,
     };
   }
 
-  list({ sort = 'new', limit = 24, offset = 0 } = {}) {
+  list({ sort = 'new', limit = 24, offset = 0, clientKey = null } = {}) {
     const visible = this.shapes.filter((s) => !s.hidden);
     const sorted = [...visible].sort((a, b) =>
-      sort === 'popular' ? b.uses - a.uses || b.createdAt - a.createdAt : b.createdAt - a.createdAt,
+      sort === 'popular'
+        ? popularity(b) - popularity(a) || b.createdAt - a.createdAt
+        : b.createdAt - a.createdAt,
     );
     const page = sorted.slice(offset, offset + limit);
+    const viewerHash = clientKey === null ? null : this.hashClient(clientKey);
     return {
-      shapes: page.map(Store.publicView),
+      shapes: page.map((shape) => ({
+        ...Store.publicView(shape),
+        liked: viewerHash !== null && (shape.likedBy ?? []).includes(viewerHash),
+      })),
       total: visible.length,
       hasMore: offset + page.length < sorted.length,
     };
@@ -128,6 +146,8 @@ export class Store {
       pathCount,
       pointCount,
       uses: 0,
+      likes: 0,
+      likedBy: [],
       createdAt: Date.now(),
       hidden: false,
       authorHash: this.hashClient(clientKey),
@@ -140,6 +160,34 @@ export class Store {
     this.shapes.push(shape);
     await this.save();
     return Store.publicView(shape);
+  }
+
+  // Whether this client has already liked a shape, for rendering the button.
+  hasLiked(shape, clientKey) {
+    return (shape.likedBy ?? []).includes(this.hashClient(clientKey));
+  }
+
+  // Toggle a like. Returns `{ ok, likes, liked }`.
+  async toggleLike(id, clientKey) {
+    const shape = this.get(id);
+    if (!shape || shape.hidden) return { ok: false };
+
+    shape.likedBy ??= [];
+    shape.likes ??= 0;
+
+    const hash = this.hashClient(clientKey);
+    const index = shape.likedBy.indexOf(hash);
+
+    if (index !== -1) {
+      shape.likedBy.splice(index, 1);
+      shape.likes = Math.max(0, shape.likes - 1);
+    } else {
+      shape.likes += 1;
+      if (shape.likedBy.length < MAX_TRACKED_LIKERS) shape.likedBy.push(hash);
+    }
+
+    await this.save();
+    return { ok: true, likes: shape.likes, liked: index === -1 };
   }
 
   async recordUse(id) {

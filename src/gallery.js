@@ -80,6 +80,11 @@ export function recordUse(id) {
   return request(`/shapes/${id}/use`, { method: 'POST' }).catch(() => null);
 }
 
+// Toggle a like. Returns `{ ok, likes, liked }`.
+export function toggleLike(id) {
+  return request(`/shapes/${id}/like`, { method: 'POST' });
+}
+
 export function reportShape(id, reason) {
   return request(`/shapes/${id}/report`, {
     method: 'POST',

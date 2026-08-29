@@ -8,6 +8,7 @@ import {
   getBounds,
   morphAt,
   normalize,
+  scaleBoxHeight,
   smooth,
   splitStroke,
 } from './morph.js';
@@ -15,6 +16,11 @@ import {
 const MAX_UNDO = 50;
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 10;
+// Ignore pointer moves closer than this (in world units). Trackpads and
+// high-rate styluses fire far more events than the stroke needs, and every
+// extra point costs on smoothing, hit testing and redraw for the rest of
+// the session.
+const MIN_POINT_DISTANCE = 1.1;
 
 const clampScale = (s) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
 
@@ -25,6 +31,7 @@ export function createDrawingCanvas(canvas, options = {}) {
     getSmoothEnabled = () => true,
     getSmoothStrength = () => 0.5,
     getMinAspect = () => 0.1,
+    getHeightScale = () => 1,
     getMode = () => 'manual',
     getShape = () => null,
     getBackground = () => '#ffffff',
@@ -34,6 +41,15 @@ export function createDrawingCanvas(canvas, options = {}) {
 
   const ctx = canvas.getContext('2d');
 
+  // Committed strokes are baked into this offscreen canvas once, instead of
+  // being redrawn every frame. Without it, render() cost grows with total
+  // drawing history rather than with what's currently animating, which is
+  // what made the canvas bog down after a lot of strokes piled up.
+  const base = document.createElement('canvas');
+  const baseCtx = base.getContext('2d');
+  let baseDirty = true;
+  let baseView = { scale: NaN, panX: NaN, panY: NaN };
+
   let strokes = [];
   let history = [];
   let animations = [];
@@ -42,6 +58,10 @@ export function createDrawingCanvas(canvas, options = {}) {
   let activePoints = [];
   let activeWidth = 3;
   let rafId = 0;
+  // Smoothing the in-progress stroke is O(points x passes); cache the result
+  // so a frame that renders the same stroke twice doesn't redo it.
+  let smoothedCache = null;
+  let smoothedForLength = -1;
 
   let width = 0;
   let height = 0;
@@ -85,6 +105,20 @@ export function createDrawingCanvas(canvas, options = {}) {
       : points;
   }
 
+  function activeSmoothed() {
+    if (smoothedForLength !== activePoints.length) {
+      smoothedCache = applySmoothing(activePoints);
+      smoothedForLength = activePoints.length;
+    }
+    return smoothedCache;
+  }
+
+  function resetActive() {
+    activePoints = [];
+    smoothedCache = null;
+    smoothedForLength = -1;
+  }
+
   function resize() {
     const rect = canvas.getBoundingClientRect();
     width = rect.width;
@@ -92,41 +126,87 @@ export function createDrawingCanvas(canvas, options = {}) {
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.max(1, Math.round(width * dpr));
     canvas.height = Math.max(1, Math.round(height * dpr));
+    baseDirty = true;
     render();
   }
 
-  function drawPolyline(points, color, lineWidth) {
+  function drawPolylineOn(context, points, color, lineWidth) {
     if (points.length === 1) {
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(points[0].x, points[0].y, lineWidth / 2, 0, Math.PI * 2);
-      ctx.fill();
+      context.fillStyle = color;
+      context.beginPath();
+      context.arc(points[0].x, points[0].y, lineWidth / 2, 0, Math.PI * 2);
+      context.fill();
       return;
     }
     if (points.length < 2) return;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = lineWidth;
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
-    ctx.stroke();
+    context.strokeStyle = color;
+    context.lineWidth = lineWidth;
+    context.beginPath();
+    context.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) context.lineTo(points[i].x, points[i].y);
+    context.stroke();
+  }
+
+  const drawPolyline = (points, color, lineWidth) => drawPolylineOn(ctx, points, color, lineWidth);
+
+  function setWorldTransform(context) {
+    const dpr = window.devicePixelRatio || 1;
+    context.setTransform(dpr * view.scale, 0, 0, dpr * view.scale, dpr * view.panX, dpr * view.panY);
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+  }
+
+  // Redraw every committed stroke onto the base layer. Only needed when the
+  // canvas resizes, the view pans/zooms, or strokes are removed/reordered
+  // (undo, clear, a stroke leaving `strokes` to become a morph animation) —
+  // none of which happen on every frame.
+  function rebuildBase() {
+    base.width = canvas.width;
+    base.height = canvas.height;
+    baseCtx.setTransform(1, 0, 0, 1, 0, 0);
+    baseCtx.clearRect(0, 0, base.width, base.height);
+    setWorldTransform(baseCtx);
+    for (const stroke of strokes) drawPolylineOn(baseCtx, stroke.points, stroke.color, stroke.width);
+    baseView = { ...view };
+    baseDirty = false;
+  }
+
+  // Append one stroke to the base layer without touching the rest of it.
+  // Only valid while the base is already up to date with the current view.
+  function bakeStroke(stroke) {
+    setWorldTransform(baseCtx);
+    drawPolylineOn(baseCtx, stroke.points, stroke.color, stroke.width);
+  }
+
+  function commitStroke(stroke) {
+    strokes.push(stroke);
+    const baseCurrent =
+      !baseDirty &&
+      base.width === canvas.width &&
+      base.height === canvas.height &&
+      view.scale === baseView.scale &&
+      view.panX === baseView.panX &&
+      view.panY === baseView.panY;
+    if (baseCurrent) bakeStroke(stroke);
+    else baseDirty = true;
   }
 
   function render() {
     const dpr = window.devicePixelRatio || 1;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, width, height);
-    ctx.setTransform(
-      dpr * view.scale, 0, 0, dpr * view.scale,
-      dpr * view.panX, dpr * view.panY,
-    );
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
+    const viewChanged =
+      view.scale !== baseView.scale || view.panX !== baseView.panX || view.panY !== baseView.panY;
+    if (baseDirty || viewChanged || base.width !== canvas.width || base.height !== canvas.height) {
+      rebuildBase();
+    }
 
-    for (const stroke of strokes) drawPolyline(stroke.points, stroke.color, stroke.width);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(base, 0, 0);
+
+    setWorldTransform(ctx);
     for (const anim of animations) drawPolyline(anim.interp, anim.color, anim.width);
     if (activePoints.length > 0) {
-      drawPolyline(applySmoothing(activePoints), getStrokeColor(), activeWidth);
+      drawPolyline(activeSmoothed(), getStrokeColor(), activeWidth);
     }
   }
 
@@ -149,7 +229,7 @@ export function createDrawingCanvas(canvas, options = {}) {
     if (settled) {
       for (const anim of animations) {
         if (!anim.done) continue;
-        strokes.push({
+        commitStroke({
           points: anim.morph.tgt.map((p) => ({ x: p.x, y: p.y })),
           color: anim.color,
           width: anim.width,
@@ -183,13 +263,16 @@ export function createDrawingCanvas(canvas, options = {}) {
 
   // Queue the animations that turn one stroke into `shape`.
   function morphStroke(stroke, shape) {
-    const box = expandBox(getBounds(stroke.points), getMinAspect(), shape.aspectRatio);
-    const pieces = splitStroke(normalize(stroke.points, box), shape.paths.length);
+    const fitted = expandBox(getBounds(stroke.points), getMinAspect(), shape.aspectRatio);
+    const box = scaleBoxHeight(fitted, getHeightScale());
+    // Normalise against the fitted box so the stroke still maps end to end;
+    // only the target box is stretched.
+    const pieces = splitStroke(normalize(stroke.points, fitted), shape.paths.length);
 
     pieces.forEach((piece, i) => {
       animations.push({
         morph: buildMorph({
-          sourcePoints: denormalize(piece, box),
+          sourcePoints: denormalize(piece, fitted),
           targetPoints: denormalize(shape.paths[i], box),
         }),
         interp: [],
@@ -212,6 +295,7 @@ export function createDrawingCanvas(canvas, options = {}) {
     // Backwards so splicing does not shift indices still to come.
     for (const { stroke, index } of pending.reverse()) {
       strokes.splice(index, 1);
+      baseDirty = true;
       morphStroke(stroke, shape);
     }
     emitChange();
@@ -221,7 +305,7 @@ export function createDrawingCanvas(canvas, options = {}) {
   function cancelStroke() {
     if (activePointerId === null) return;
     activePointerId = null;
-    activePoints = [];
+    resetActive();
     render();
   }
 
@@ -249,7 +333,8 @@ export function createDrawingCanvas(canvas, options = {}) {
       // Capture is an optimisation; drawing still works without it.
     }
     activeWidth = getStrokeWidth();
-    activePoints = [toWorld(toLocal(event))];
+    resetActive();
+    activePoints.push(toWorld(toLocal(event)));
     render();
   }
 
@@ -270,13 +355,18 @@ export function createDrawingCanvas(canvas, options = {}) {
     }
 
     if (event.pointerId !== activePointerId) return;
-    activePoints.push(toWorld(toLocal(event)));
+    const next = toWorld(toLocal(event));
+    const last = activePoints[activePoints.length - 1];
+    if (last && Math.hypot(next.x - last.x, next.y - last.y) * view.scale < MIN_POINT_DISTANCE) {
+      return;
+    }
+    activePoints.push(next);
     schedule();
   }
 
   function finishStroke() {
-    const points = applySmoothing(activePoints);
-    activePoints = [];
+    const points = activeSmoothed();
+    resetActive();
     if (points.length === 0) return;
 
     pushHistory();
@@ -287,7 +377,7 @@ export function createDrawingCanvas(canvas, options = {}) {
       morphStroke(stroke, shape);
       schedule();
     } else {
-      strokes.push(stroke);
+      commitStroke(stroke);
     }
     render();
     emitChange();
@@ -343,6 +433,7 @@ export function createDrawingCanvas(canvas, options = {}) {
       if (history.length === 0) return;
       strokes = history.pop();
       animations = [];
+      baseDirty = true;
       render();
       emitChange();
     },
@@ -352,8 +443,33 @@ export function createDrawingCanvas(canvas, options = {}) {
       pushHistory();
       strokes = [];
       animations = [];
+      baseDirty = true;
       render();
       emitChange();
+    },
+
+    // Turn what is currently drawn into shape SVG, so a drawing made here can
+    // become a shape without a round trip through a raster file. Coordinates
+    // are shifted to the drawing's own bounds; scale is irrelevant downstream
+    // because shapes are normalised on load.
+    toShapeSvg() {
+      const usable = strokes.filter((stroke) => stroke.points.length >= 2);
+      if (usable.length === 0) return null;
+
+      const bounds = getBounds(usable.flatMap((stroke) => stroke.points));
+      const body = usable
+        .map((stroke) => {
+          const d = stroke.points
+            .map((p, i) =>
+              `${i === 0 ? 'M' : 'L'}${(p.x - bounds.minX).toFixed(2)} ${(p.y - bounds.minY).toFixed(2)}`)
+            .join(' ');
+          return `  <path d="${d}"/>`;
+        })
+        .join('\n');
+
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${bounds.width.toFixed(2)} ${bounds.height.toFixed(2)}" fill="none" stroke="#000000" stroke-width="${(Math.max(bounds.width, bounds.height) / 160).toFixed(2)}" stroke-linecap="round" stroke-linejoin="round">
+${body}
+</svg>`;
     },
 
     // Flatten onto an opaque background for saving.

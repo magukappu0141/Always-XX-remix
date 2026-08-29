@@ -59,6 +59,7 @@ function rateLimit(key, { capacity, refillPerMs }) {
 
 const WRITE_LIMIT = { capacity: 5, refillPerMs: 1 / 60000 };   // ~5 burst, 1/min
 const READ_LIMIT = { capacity: 120, refillPerMs: 1 / 1000 };   // ~120 burst, 1/s
+const LIKE_LIMIT = { capacity: 30, refillPerMs: 1 / 3000 };    // ~30 burst, 1/3s
 
 function clientKey(req) {
   // Trust the proxy's first hop only; nginx is expected to set this.
@@ -143,8 +144,9 @@ async function handle(req, res, store) {
     const sort = url.searchParams.get('sort') === 'popular' ? 'popular' : 'new';
     const limit = Math.min(PAGE_LIMIT, Math.max(1, Number(url.searchParams.get('limit') ?? 24) || 24));
     const offset = Math.max(0, Number(url.searchParams.get('offset') ?? 0) || 0);
-    return send(res, 200, store.list({ sort, limit, offset }), {
-      'cache-control': 'public, max-age=30',
+    // Per-viewer liked flags mean this response is not shareable between users.
+    return send(res, 200, store.list({ sort, limit, offset, clientKey: key }), {
+      'cache-control': 'private, max-age=15',
     });
   }
 
@@ -187,6 +189,15 @@ async function handle(req, res, store) {
     if (!rateLimit(key, READ_LIMIT)) return fail(res, 429, 'rate_limited', 'too many requests');
     const ok = await store.recordUse(useMatch[1]);
     return ok ? send(res, 200, { ok: true }) : fail(res, 404, 'not_found', 'shape not found');
+  }
+
+  const likeMatch = path.match(/^\/api\/shapes\/([\w-]+)\/like$/);
+  if (req.method === 'POST' && likeMatch) {
+    if (!rateLimit(key, LIKE_LIMIT)) return fail(res, 429, 'rate_limited', 'too many requests');
+    const result = await store.toggleLike(likeMatch[1], key);
+    return result.ok
+      ? send(res, 200, { ok: true, likes: result.likes, liked: result.liked })
+      : fail(res, 404, 'not_found', 'shape not found');
   }
 
   const reportMatch = path.match(/^\/api\/shapes\/([\w-]+)\/report$/);

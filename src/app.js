@@ -27,7 +27,14 @@ import {
 } from './shapes.js';
 import { DEFAULT_TRACE_OPTIONS, loadImage, pathsToSvg, traceImage } from './trace.js';
 import { GALLERY_ENABLED } from './config.js';
-import { hydrate, listShapes, publishShape, recordUse, reportShape } from './gallery.js';
+import {
+  hydrate,
+  listShapes,
+  publishShape,
+  recordUse,
+  reportShape,
+  toggleLike,
+} from './gallery.js';
 
 const SETTINGS_KEY = 'always-xx:settings';
 const AUTHOR_KEY = 'always-xx:author';
@@ -44,6 +51,7 @@ const DEFAULT_SETTINGS = {
   smoothEnabled: true,
   smoothStrength: 0.5,
   minAspect: 0.1,
+  heightScale: 1,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -296,7 +304,42 @@ function galleryCard(entry, shape) {
 
   const meta = document.createElement('span');
   meta.className = 'gallery-card__meta';
-  meta.textContent = `${t('gallery.by', { author: entry.author })} · ${t('gallery.uses', { count: entry.uses })}`;
+  meta.textContent = t('gallery.by', { author: entry.author });
+
+  // Likes live in their own control so tapping one doesn't pick the shape.
+  let liked = Boolean(entry.liked);
+  let likes = entry.likes ?? 0;
+  const like = document.createElement('button');
+  like.type = 'button';
+  like.className = 'gallery-card__like';
+
+  const syncLike = () => {
+    like.classList.toggle('is-liked', liked);
+    like.title = t(liked ? 'gallery.unlike' : 'gallery.like');
+    like.setAttribute('aria-pressed', String(liked));
+    like.textContent = `${liked ? '♥' : '♡'} ${likes}`;
+  };
+  syncLike();
+
+  like.addEventListener('click', async (event) => {
+    event.stopPropagation();
+    // Flip immediately, then reconcile with whatever the server reports.
+    liked = !liked;
+    likes += liked ? 1 : -1;
+    syncLike();
+    like.disabled = true;
+    try {
+      const result = await toggleLike(entry.id);
+      liked = result.liked;
+      likes = result.likes;
+    } catch {
+      liked = !liked;
+      likes += liked ? 1 : -1;
+    } finally {
+      like.disabled = false;
+      syncLike();
+    }
+  });
 
   const report = document.createElement('button');
   report.type = 'button';
@@ -314,7 +357,7 @@ function galleryCard(entry, shape) {
     }
   });
 
-  card.append(report, art, name, meta);
+  card.append(report, art, name, meta, like);
   card.addEventListener('click', () => {
     activeShape = shape;
     recordUse(entry.id);
@@ -596,6 +639,8 @@ function syncSettings() {
   }
   $('min-aspect').value = String(settings.minAspect);
   $('min-aspect-value').textContent = `${Math.round(settings.minAspect * 100)}%`;
+  $('height-scale').value = String(settings.heightScale);
+  $('height-scale-value').textContent = `${Math.round(settings.heightScale * 100)}%`;
   $('stroke-width').value = String(settings.strokeWidth);
   $('stroke-width-value').textContent = `${settings.strokeWidth.toFixed(1)}px`;
   $('smooth-enabled').checked = settings.smoothEnabled;
@@ -666,6 +711,26 @@ function showTracePreview(paths, aspectRatio) {
   box.appendChild(buildPreview(paths, aspectRatio, 0.012));
   $('trace-count').textContent = t('custom.pathCount', { count: paths.length });
   $('trace-preview').hidden = false;
+}
+
+// Seed the creator with SVG that already exists (a drawing made on the canvas),
+// skipping the file picker and tracing controls entirely.
+function adoptDrawnShape(svg) {
+  try {
+    draft.svg = svg;
+    draft.image = null;
+    ({ paths: draft.paths, aspectRatio: draft.aspectRatio } = prepareShapeSource(svg));
+  } catch {
+    showCustomError('custom.errorParse');
+    return;
+  }
+  $('trace-options').hidden = true;
+  showTracePreview(draft.paths, draft.aspectRatio);
+  // Sharing is the point of this entry path, so opt in by default.
+  if (GALLERY_ENABLED) {
+    $('publish-toggle').checked = true;
+    $('publish-author-cell').hidden = false;
+  }
 }
 
 // Re-run the tracer with the current slider values.
@@ -840,6 +905,7 @@ async function init() {
     getSmoothEnabled: () => settings.smoothEnabled,
     getSmoothStrength: () => settings.smoothStrength,
     getMinAspect: () => settings.minAspect,
+    getHeightScale: () => settings.heightScale,
     getMode: () => settings.mode,
     getShape: () => activeShape,
     getBackground: () => '#ffffff',
@@ -847,6 +913,7 @@ async function init() {
       $('tool-undo').disabled = !canUndo;
       $('tool-morph').disabled = !canMorph;
       $('tool-save').disabled = !hasContent;
+      $('tool-publish').disabled = !hasContent || !GALLERY_ENABLED;
       $('tool-clear').disabled = !hasContent;
       updateStageText(hasContent);
     },
@@ -904,6 +971,15 @@ async function init() {
     URL.revokeObjectURL(url);
   });
   $('zoom-reset').addEventListener('click', () => drawing.resetView());
+  $('tool-publish').addEventListener('click', () => {
+    const svg = drawing.toShapeSvg();
+    if (!svg) {
+      alert(t('draw.publishEmpty'));
+      return;
+    }
+    openCustomSheet();
+    adoptDrawnShape(svg);
+  });
 
   // Settings
   for (const el of document.querySelectorAll('[data-set-mode]')) {
@@ -916,6 +992,11 @@ async function init() {
   }
   $('min-aspect').addEventListener('input', (e) => {
     settings.minAspect = Number(e.target.value);
+    saveSettings();
+    syncSettings();
+  });
+  $('height-scale').addEventListener('input', (e) => {
+    settings.heightScale = Number(e.target.value);
     saveSettings();
     syncSettings();
   });
