@@ -34,6 +34,7 @@ const AUTHOR_KEY = 'always-xx:author';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const SHAPES_PER_PAGE = 2;
 const GALLERY_PAGE = 24;
+const FEATURED_POPULAR_LIMIT = 24;
 
 const DEFAULT_SETTINGS = {
   mode: 'manual',
@@ -68,11 +69,29 @@ function saveSettings() {
 
 let builtinShapes = [];
 let customShapes = [];
+// Popular community submissions, shown in place of the built-in defaults.
+// builtinShapes is kept only as a fallback for when the gallery has nothing
+// yet (or is unreachable), so the picker is never empty.
+let popularShapes = [];
 let activeShape = null;
 let drawing = null;
 let shapePage = 0;
 
-const allShapes = () => [...customShapes, ...builtinShapes];
+const allShapes = () => {
+  const featured = popularShapes.length > 0 ? popularShapes : builtinShapes;
+  return [...customShapes, ...featured];
+};
+
+async function loadPopularShapes() {
+  if (!GALLERY_ENABLED) return [];
+  try {
+    const page = await listShapes({ sort: 'popular', limit: FEATURED_POPULAR_LIMIT });
+    const settled = await Promise.allSettled(page.shapes.map(hydrate));
+    return settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+  } catch {
+    return [];
+  }
+}
 
 function applyTranslations(root = document) {
   for (const el of root.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
@@ -85,14 +104,43 @@ function applyTranslations(root = document) {
   }
 }
 
+// One-time build of the corner language buttons; call syncLangSwitch after.
+function buildLangSwitch() {
+  const wrap = $('lang-switch');
+  wrap.textContent = '';
+  for (const { code, label } of LOCALES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'lang-switch__btn';
+    btn.textContent = label;
+    btn.addEventListener('click', () => setLocale(code));
+    wrap.appendChild(btn);
+  }
+}
+
+function syncLangSwitch() {
+  const current = getLocale();
+  const buttons = $('lang-switch').querySelectorAll('.lang-switch__btn');
+  LOCALES.forEach(({ code }, i) => buttons[i].classList.toggle('is-active', code === current));
+}
+
 /**
  * Build an SVG from a shape's parsed points rather than injecting the source
  * markup; imported files are untrusted input.
+ *
+ * Points are stored normalized independently on x and y (see morph.js
+ * normalize), which squashes a non-square shape into a 0..1 unit box. A
+ * plain square viewBox would render that squash as-is. Instead we keep the
+ * square viewBox (it matches the stored point space) but size the <svg>
+ * element itself to the shape's true aspect ratio and turn off
+ * preserveAspectRatio, so the browser's non-uniform scale undoes the squash.
  */
-function buildPreview(paths, strokeWidth = 0.02) {
+function buildPreview(paths, aspectRatio = 1, strokeWidth = 0.02) {
   const svg = document.createElementNS(SVG_NS, 'svg');
   const pad = 0.05;
   svg.setAttribute('viewBox', `${-pad} ${-pad} ${1 + pad * 2} ${1 + pad * 2}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.style.aspectRatio = String(aspectRatio > 0 ? aspectRatio : 1);
   svg.setAttribute('fill', 'none');
   svg.setAttribute('stroke', 'currentColor');
   svg.setAttribute('stroke-width', String(strokeWidth));
@@ -143,7 +191,7 @@ function renderShapeGrid() {
     const art = document.createElement('div');
     art.className = 'shape-card__art';
     art.style.color = shape.themeColor;
-    art.appendChild(buildPreview(shape.paths));
+    art.appendChild(buildPreview(shape.paths, shape.aspectRatio));
 
     const name = document.createElement('span');
     name.className = 'shape-card__name';
@@ -152,10 +200,11 @@ function renderShapeGrid() {
     card.append(art, name);
     card.addEventListener('click', () => {
       activeShape = shape;
+      if (shape.shared) recordUse(shape.remoteId);
       showScreen('mode');
     });
 
-    if (!shape.builtin) {
+    if (!shape.builtin && !shape.shared) {
       const del = document.createElement('button');
       del.type = 'button';
       del.className = 'shape-card__delete';
@@ -174,7 +223,7 @@ function renderShapeGrid() {
     grid.appendChild(card);
   }
 
-  grid.appendChild(actionCard('shape.custom', CUSTOM_ICON, openCustomSheet));
+  grid.appendChild(actionCard('shape.custom', CUSTOM_ICON, openMyShapes));
   if (GALLERY_ENABLED) {
     grid.appendChild(actionCard('gallery.open', GALLERY_ICON, openGallery));
   }
@@ -239,7 +288,7 @@ function galleryCard(entry, shape) {
   const art = document.createElement('div');
   art.className = 'gallery-card__art';
   art.style.color = entry.themeColor;
-  art.appendChild(buildPreview(shape.paths, 0.025));
+  art.appendChild(buildPreview(shape.paths, shape.aspectRatio, 0.025));
 
   const name = document.createElement('span');
   name.className = 'gallery-card__name';
@@ -310,6 +359,62 @@ async function loadGalleryPage(append = false) {
 function openGallery() {
   $('gallery-sheet').hidden = false;
   loadGalleryPage(false);
+}
+
+function myShapeCard(shape) {
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'gallery-card';
+
+  const art = document.createElement('div');
+  art.className = 'gallery-card__art';
+  art.style.color = shape.themeColor;
+  art.appendChild(buildPreview(shape.paths, shape.aspectRatio, 0.025));
+
+  const name = document.createElement('span');
+  name.className = 'gallery-card__name';
+  name.textContent = localizedName(shape.name);
+
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'gallery-card__report';
+  del.textContent = t('shape.delete');
+  del.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (!confirm(t('shape.deleteConfirm', { name: localizedName(shape.name) }))) return;
+    customShapes = customShapes.filter((s) => s.id !== shape.id);
+    saveCustomShapes(customShapes);
+    renderMyShapes();
+    renderShapeGrid();
+  });
+
+  card.append(del, art, name);
+  card.addEventListener('click', () => {
+    activeShape = shape;
+    $('my-shapes-sheet').hidden = true;
+    showScreen('mode');
+  });
+  return card;
+}
+
+function renderMyShapes() {
+  const list = $('my-shapes-list');
+  list.textContent = '';
+  for (const shape of customShapes) list.appendChild(myShapeCard(shape));
+  const status = $('my-shapes-status');
+  status.hidden = customShapes.length > 0;
+  if (!status.hidden) status.textContent = t('myshapes.empty');
+}
+
+// If nothing is saved yet, skip straight to the creator instead of showing
+// an empty list with nothing to tap but "create".
+function openMyShapes() {
+  if (customShapes.length === 0) {
+    openCustomSheet();
+    return;
+  }
+  renderMyShapes();
+  $('my-shapes-sheet').hidden = false;
 }
 
 let demoRaf = 0;
@@ -502,11 +607,11 @@ function syncSettings() {
 }
 
 // Holds the pending import between file pick and save.
-let draft = { svg: null, image: null, paths: null };
+let draft = { svg: null, image: null, paths: null, aspectRatio: 1 };
 let traceTimer = 0;
 
 function openCustomSheet() {
-  draft = { svg: null, image: null, paths: null };
+  draft = { svg: null, image: null, paths: null, aspectRatio: 1 };
   $('custom-name').value = '';
   $('custom-file').value = '';
   $('trace-preview').hidden = true;
@@ -555,10 +660,10 @@ function syncTraceLabels() {
   $('trace-detail-value').textContent = Number($('trace-detail').value).toFixed(1);
 }
 
-function showTracePreview(paths) {
+function showTracePreview(paths, aspectRatio) {
   const box = $('trace-preview-box');
   box.textContent = '';
-  box.appendChild(buildPreview(paths, 0.012));
+  box.appendChild(buildPreview(paths, aspectRatio, 0.012));
   $('trace-count').textContent = t('custom.pathCount', { count: paths.length });
   $('trace-preview').hidden = false;
 }
@@ -588,8 +693,8 @@ function retrace() {
       }
       showCustomError(null);
       draft.svg = pathsToSvg(paths, width, height);
-      draft.paths = prepareShapeSource(draft.svg).paths;
-      showTracePreview(draft.paths);
+      ({ paths: draft.paths, aspectRatio: draft.aspectRatio } = prepareShapeSource(draft.svg));
+      showTracePreview(draft.paths, draft.aspectRatio);
     } catch {
       showCustomError('custom.errorParse');
     } finally {
@@ -618,13 +723,13 @@ async function handleFilePicked(file) {
     try {
       draft.svg = await file.text();
       draft.image = null;
-      draft.paths = prepareShapeSource(draft.svg).paths;
+      ({ paths: draft.paths, aspectRatio: draft.aspectRatio } = prepareShapeSource(draft.svg));
     } catch {
       showCustomError('custom.errorParse');
       return;
     }
     $('trace-options').hidden = true;
-    showTracePreview(draft.paths);
+    showTracePreview(draft.paths, draft.aspectRatio);
     return;
   }
 
@@ -717,11 +822,15 @@ async function init() {
   }
   localeSelect.addEventListener('change', () => setLocale(localeSelect.value));
 
+  buildLangSwitch();
+  syncLangSwitch();
+
   onLocaleChange(() => {
     applyTranslations();
     renderShapeGrid();
     renderToolbarPalette();
     syncSettings();
+    syncLangSwitch();
     updateStageText(!$('tool-clear').disabled);
   });
 
@@ -849,6 +958,10 @@ async function init() {
     });
   }
   $('gallery-more').addEventListener('click', () => loadGalleryPage(true));
+  $('my-shapes-create').addEventListener('click', () => {
+    $('my-shapes-sheet').hidden = true;
+    openCustomSheet();
+  });
   $('trace-threshold').addEventListener('input', scheduleRetrace);
   $('trace-detail').addEventListener('input', scheduleRetrace);
   $('trace-invert').addEventListener('change', scheduleRetrace);
@@ -874,7 +987,7 @@ async function init() {
   syncSettings();
 
   customShapes = loadCustomShapes();
-  builtinShapes = await loadBuiltinShapes();
+  [builtinShapes, popularShapes] = await Promise.all([loadBuiltinShapes(), loadPopularShapes()]);
   renderShapeGrid();
 }
 

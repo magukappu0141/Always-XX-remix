@@ -6,7 +6,7 @@ export const LOCALES = [
   { code: 'zh', label: '简体中文' },
 ];
 
-export const DEFAULT_LOCALE = 'ja';
+export const DEFAULT_LOCALE = 'en';
 
 const MESSAGES = {
   ja: {
@@ -88,7 +88,11 @@ const MESSAGES = {
     'custom.errorEmpty': '線を検出できませんでした。「線の拾い方」を調整してみてください',
     'custom.errorStorage': '保存できませんでした。ブラウザの保存容量が足りない可能性があります',
 
-    'gallery.title': 'みんなの図案',
+        'myshapes.title': 'オリジナル図案',
+    'myshapes.create': '新しく作る',
+    'myshapes.empty': 'まだ作っていません。「新しく作る」から始めましょう',
+
+'gallery.title': 'みんなの図案',
     'gallery.open': 'みんなの図案',
     'gallery.sortNew': '新着',
     'gallery.sortPopular': '人気',
@@ -195,7 +199,11 @@ const MESSAGES = {
     'custom.errorEmpty': 'No strokes found. Try adjusting the line pickup',
     'custom.errorStorage': 'Could not save. Your browser storage may be full',
 
-    'gallery.title': 'Community shapes',
+        'myshapes.title': 'Your shapes',
+    'myshapes.create': 'Create new',
+    'myshapes.empty': "You haven't made one yet. Start with Create new",
+
+'gallery.title': 'Community shapes',
     'gallery.open': 'Community shapes',
     'gallery.sortNew': 'Newest',
     'gallery.sortPopular': 'Popular',
@@ -302,7 +310,11 @@ const MESSAGES = {
     'custom.errorEmpty': '没有检测到笔画，试着调整「取线强度」',
     'custom.errorStorage': '保存失败，浏览器存储空间可能已满',
 
-    'gallery.title': '大家的图案',
+        'myshapes.title': '自定义图案',
+    'myshapes.create': '新建图案',
+    'myshapes.empty': '还没有制作过，点击「新建图案」开始吧',
+
+'gallery.title': '大家的图案',
     'gallery.open': '大家的图案',
     'gallery.sortNew': '最新',
     'gallery.sortPopular': '热门',
@@ -333,18 +345,14 @@ const MESSAGES = {
 
 const STORAGE_KEY = 'always-xx:locale';
 
+// English by default for everyone; only a locale the visitor picked themselves
+// (saved from a previous visit) overrides it. No browser-language sniffing.
 function detectLocale() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved && MESSAGES[saved]) return saved;
   } catch {
-    // Storage unavailable; fall through to navigator detection.
-  }
-  for (const tag of navigator.languages ?? [navigator.language ?? '']) {
-    const lower = tag.toLowerCase();
-    if (lower.startsWith('ja')) return 'ja';
-    if (lower.startsWith('zh')) return 'zh';
-    if (lower.startsWith('en')) return 'en';
+    // Storage unavailable; use the default.
   }
   return DEFAULT_LOCALE;
 }
