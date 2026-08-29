@@ -1,0 +1,32 @@
+[Unit]
+Description=Always XX shape gallery API
+After=network.target
+
+[Service]
+Type=simple
+User=alwaysxx
+WorkingDirectory=/var/www/always-xx/server
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+Environment=DATA_DIR=/var/lib/always-xx
+EnvironmentFile=/etc/always-xx.env
+ExecStart=/usr/bin/node --max-old-space-size=96 server.js
+Restart=on-failure
+RestartSec=5
+
+# Stay out of the game server's way.
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryMax=160M
+TasksMax=64
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/always-xx
+
+[Install]
+WantedBy=multi-user.target

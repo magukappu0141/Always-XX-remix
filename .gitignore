@@ -1,0 +1,7 @@
+_upstream/
+node_modules/
+.DS_Store
+
+# Runtime data for the gallery API
+server/data/
+*.tmp
