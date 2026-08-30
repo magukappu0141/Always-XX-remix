@@ -1,6 +1,6 @@
 // Screen flow, toolbar, settings, and the custom shape creator.
 
-import { createDrawingCanvas } from './canvas.js';
+import { canRecordMorph, createDrawingCanvas } from './canvas.js';
 import {
   LOCALES,
   getLocale,
@@ -90,6 +90,9 @@ let popularShapes = [];
 let activeShape = null;
 let drawing = null;
 let shapePage = 0;
+// True while the shape picker was opened from the draw screen rather than
+// at the start of a session; changes what picking a shape does next.
+let switchingShapeMidDraw = false;
 
 const allShapes = () => {
   const featured = popularShapes.length > 0 ? popularShapes : builtinShapes;
@@ -178,11 +181,16 @@ function showScreen(which) {
   for (const el of document.querySelectorAll('[data-screen]')) {
     el.hidden = el.dataset.screen !== which;
   }
-  $('steps').hidden = which === 'draw';
+  // Hide the onboarding breadcrumb when switching shapes mid-drawing — the
+  // picker is reused for that, but it isn't the start of a new session.
+  $('steps').hidden = which === 'draw' || switchingShapeMidDraw;
   for (const el of document.querySelectorAll('.steps__item')) {
     el.classList.toggle('is-active', el.dataset.step === which);
   }
-  if (which === 'draw') drawing.resize();
+  if (which === 'draw') {
+    drawing.resize();
+    updateStageText(!$('tool-clear').disabled);
+  }
   if (which === 'mode') startModeDemos();
   else stopModeDemos();
 }
@@ -215,7 +223,14 @@ function renderShapeGrid() {
     card.addEventListener('click', () => {
       activeShape = shape;
       if (shape.shared) recordUse(shape.remoteId);
-      showScreen('mode');
+      if (switchingShapeMidDraw) {
+        // Mode is already locked in for this session; new strokes just start
+        // targeting the newly picked shape.
+        switchingShapeMidDraw = false;
+        showScreen('draw');
+      } else {
+        showScreen('mode');
+      }
     });
 
     if (!shape.builtin && !shape.shared) {
@@ -975,6 +990,7 @@ async function init() {
     onChange: ({ hasContent, canUndo, canMorph }) => {
       $('tool-undo').disabled = !canUndo;
       $('tool-morph').disabled = !canMorph;
+      if (!$('tool-record').hidden) $('tool-record').disabled = !canMorph;
       $('tool-save').disabled = !hasContent;
       $('tool-publish').disabled = !hasContent || !GALLERY_ENABLED;
       $('tool-clear').disabled = !hasContent;
@@ -1014,12 +1030,40 @@ async function init() {
     renderToolbarPalette();
   });
   $('tool-undo').addEventListener('click', () => drawing.undo());
-  $('tool-shape').addEventListener('click', () => showScreen('shape'));
+  $('tool-shape').addEventListener('click', () => {
+    switchingShapeMidDraw = true;
+    shapePage = 0;
+    renderShapeGrid();
+    showScreen('shape');
+  });
   $('tool-settings').addEventListener('click', () => {
     syncSettings();
     $('settings-sheet').hidden = false;
   });
   $('tool-morph').addEventListener('click', () => drawing.morphAll(activeShape));
+  if (canRecordMorph()) {
+    $('tool-record').hidden = false;
+    $('tool-record').addEventListener('click', async () => {
+      const btn = $('tool-record');
+      btn.disabled = true;
+      btn.classList.add('is-recording');
+      try {
+        const blob = await drawing.recordMorph(activeShape);
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+        link.download = `always-xx-${Date.now()}.${ext}`;
+        link.click();
+        URL.revokeObjectURL(url);
+      } catch {
+        alert(t('draw.recordFailed'));
+      } finally {
+        btn.classList.remove('is-recording');
+        btn.disabled = $('tool-morph').disabled;
+      }
+    });
+  }
   $('tool-clear').addEventListener('click', () => {
     if (confirm(t('draw.clearConfirm'))) drawing.clear();
   });

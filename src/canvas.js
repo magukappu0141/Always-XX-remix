@@ -24,6 +24,31 @@ const MIN_POINT_DISTANCE = 1.1;
 
 const clampScale = (s) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
 
+// Preference order: vp9 is smaller for the same quality, mp4 is Safari's
+// only option. No dependency pulled in for this — MediaRecorder is native.
+const VIDEO_MIME_CANDIDATES = [
+  'video/webm;codecs=vp9',
+  'video/webm;codecs=vp8',
+  'video/webm',
+  'video/mp4',
+];
+
+export function canRecordMorph() {
+  return (
+    typeof MediaRecorder !== 'undefined' &&
+    typeof HTMLCanvasElement !== 'undefined' &&
+    typeof HTMLCanvasElement.prototype.captureStream === 'function' &&
+    pickVideoMimeType() !== ''
+  );
+}
+
+function pickVideoMimeType() {
+  for (const type of VIDEO_MIME_CANDIDATES) {
+    if (MediaRecorder.isTypeSupported?.(type)) return type;
+  }
+  return '';
+}
+
 export function createDrawingCanvas(canvas, options = {}) {
   const {
     getStrokeColor = () => '#000000',
@@ -284,8 +309,7 @@ export function createDrawingCanvas(canvas, options = {}) {
     });
   }
 
-  function morphAll(shape) {
-    if (!shape || shape.paths.length === 0) return;
+  function morphAll(fallbackShape) {
     const pending = strokes
       .map((stroke, index) => ({ stroke, index }))
       .filter(({ stroke }) => !stroke.morphed);
@@ -294,6 +318,10 @@ export function createDrawingCanvas(canvas, options = {}) {
     pushHistory();
     // Backwards so splicing does not shift indices still to come.
     for (const { stroke, index } of pending.reverse()) {
+      // Strokes drawn before this feature existed (or restored from an old
+      // save) have no shape of their own; fall back to whatever is current.
+      const shape = stroke.shape ?? fallbackShape;
+      if (!shape || shape.paths.length === 0) continue;
       strokes.splice(index, 1);
       baseDirty = true;
       morphStroke(stroke, shape);
@@ -370,9 +398,9 @@ export function createDrawingCanvas(canvas, options = {}) {
     if (points.length === 0) return;
 
     pushHistory();
-    const stroke = { points, color: getStrokeColor(), width: activeWidth, morphed: false };
-
     const shape = getShape();
+    const stroke = { points, color: getStrokeColor(), width: activeWidth, morphed: false, shape };
+
     if (getMode() === 'auto' && shape && shape.paths.length > 0) {
       morphStroke(stroke, shape);
       schedule();
@@ -422,9 +450,63 @@ export function createDrawingCanvas(canvas, options = {}) {
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(canvas);
 
+  // Record the next morph as a video clip: start capturing the visible
+  // canvas, trigger morphAll, and stop once every queued animation has
+  // settled. Returns the clip as a Blob.
+  async function recordMorph(fallbackShape, { maxMs = 6000 } = {}) {
+    if (!canRecordMorph()) throw new Error('Video recording is not supported in this browser');
+    const hasPending = strokes.some((s) => !s.morphed);
+    if (!hasPending) throw new Error('Nothing to morph');
+
+    const mimeType = pickVideoMimeType();
+    const stream = canvas.captureStream(30);
+    const recorder = new MediaRecorder(stream, { mimeType });
+    const chunks = [];
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) chunks.push(event.data);
+    };
+
+    const stopped = new Promise((resolve, reject) => {
+      recorder.onstop = () => resolve(new Blob(chunks, { type: recorder.mimeType || mimeType }));
+      recorder.onerror = (event) => reject(event.error ?? new Error('Recording failed'));
+    });
+
+    recorder.start();
+    // Let the recorder actually start emitting before the morph begins, so
+    // the clip doesn't open on a blank frame.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    morphAll(fallbackShape);
+
+    // Wait for either the morph to actually settle, or maxMs to run out —
+    // whichever comes first. These must race rather than run independently:
+    // a backgrounded tab (switched away, screen locked) freezes the rAF loop
+    // that drives the morph, so animations.length can stay non-zero forever.
+    // Without the race, a plain "stop after maxMs" would still leave this
+    // function waiting on a settle that can no longer happen.
+    let settled = false;
+    await Promise.race([
+      new Promise((resolve) => {
+        const check = () => {
+          if (settled || animations.length === 0) resolve();
+          else setTimeout(check, 40);
+        };
+        check();
+      }),
+      new Promise((resolve) => setTimeout(resolve, maxMs)),
+    ]);
+    settled = true;
+
+    // Hold the settled frame briefly so the clip doesn't cut off mid-blend.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    if (recorder.state !== 'inactive') recorder.stop();
+
+    return stopped;
+  }
+
   return {
     resize,
     morphAll,
+    recordMorph,
 
     getView: () => ({ ...view }),
     resetView: () => setView({ scale: 1, panX: 0, panY: 0 }),

@@ -925,3 +925,17 @@ input[type="color"] {
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+/* Record button */
+
+.tool--record { color: var(--color-clear-ink); }
+.tool--record:hover:not(:disabled) { background: var(--color-clear-bg); }
+
+.tool--record.is-recording circle:last-child {
+  animation: record-pulse 1s ease-in-out infinite;
+}
+
+@keyframes record-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
