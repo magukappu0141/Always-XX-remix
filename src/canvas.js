@@ -493,11 +493,36 @@ export function createDrawingCanvas(canvas, options = {}) {
   // Render one animated GIF frame at progress `t` (0..1) onto `snapCtx`,
   // sized outW x outH — the settled base layer plus every pending batch's
   // interpolated position at that point in the morph.
-  function drawGifFrame(snapCtx, outW, outH, outScale, batches, t) {
+  // A static backdrop for the GIF export: background plus every already-
+  // settled stroke, scaled to the export size. Deliberately built fresh
+  // rather than reused from `base` — `base` bakes a stroke in the moment
+  // it's drawn, before anyone has decided whether it's about to be morphed,
+  // so it still contains the pending strokes this export is about to
+  // animate. Compositing those under their own animation would leave the
+  // original doodle showing through for the whole clip, most obviously in
+  // the final frame once it no longer resembles the finished shape at all.
+  function buildGifBackdrop(outW, outH, outScale) {
+    const backdrop = document.createElement('canvas');
+    backdrop.width = outW;
+    backdrop.height = outH;
+    const bctx = backdrop.getContext('2d');
+    bctx.fillStyle = getBackground();
+    bctx.fillRect(0, 0, outW, outH);
+
+    const dpr = window.devicePixelRatio || 1;
+    const s = outScale * dpr * view.scale;
+    bctx.setTransform(s, 0, 0, s, outScale * dpr * view.panX, outScale * dpr * view.panY);
+    bctx.lineCap = 'round';
+    bctx.lineJoin = 'round';
+    for (const stroke of strokes) {
+      if (stroke.morphed) drawPolylineOn(bctx, stroke.points, stroke.color, stroke.width);
+    }
+    return backdrop;
+  }
+
+  function drawGifFrame(snapCtx, outW, outH, outScale, backdrop, batches, t) {
     snapCtx.setTransform(1, 0, 0, 1, 0, 0);
-    snapCtx.fillStyle = getBackground();
-    snapCtx.fillRect(0, 0, outW, outH);
-    snapCtx.drawImage(base, 0, 0, canvas.width, canvas.height, 0, 0, outW, outH);
+    snapCtx.drawImage(backdrop, 0, 0);
 
     const dpr = window.devicePixelRatio || 1;
     const s = outScale * dpr * view.scale;
@@ -532,6 +557,7 @@ export function createDrawingCanvas(canvas, options = {}) {
     const outScale = Math.min(1, GIF_MAX_DIMENSION / Math.max(canvas.width, canvas.height));
     const outW = Math.max(1, Math.round(canvas.width * outScale));
     const outH = Math.max(1, Math.round(canvas.height * outScale));
+    const backdrop = buildGifBackdrop(outW, outH, outScale);
     const snap = document.createElement('canvas');
     snap.width = outW;
     snap.height = outH;
@@ -543,7 +569,7 @@ export function createDrawingCanvas(canvas, options = {}) {
 
     const frames = [];
     for (let i = 0; i <= stepCount; i++) {
-      drawGifFrame(snapCtx, outW, outH, outScale, batches, i / stepCount);
+      drawGifFrame(snapCtx, outW, outH, outScale, backdrop, batches, i / stepCount);
       frames.push({ data: snapCtx.getImageData(0, 0, outW, outH).data, delayCs });
     }
     // Hold the drawing before it starts moving, and the finished shape after,
