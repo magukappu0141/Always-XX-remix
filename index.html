@@ -299,10 +299,16 @@
                 <input id="trace-detail" class="slider" type="range" min="0.4" max="4" step="0.2">
                 <span class="cell__value" id="trace-detail-value"></span>
               </div>
+              <div class="cell">
+                <span class="cell__title" data-i18n="custom.smoothness"></span>
+                <input id="trace-smooth" class="slider" type="range" min="0" max="6" step="0.2">
+                <span class="cell__value" id="trace-smooth-value"></span>
+              </div>
               <label class="cell">
                 <span class="cell__title" data-i18n="custom.invert"></span>
                 <input id="trace-invert" class="switch" type="checkbox">
               </label>
+              <button class="cell cell--action" id="trace-auto" type="button" data-i18n="custom.autoThreshold"></button>
             </div>
           </section>
 

@@ -25,7 +25,13 @@ import {
   prepareShapeSource,
   saveCustomShapes,
 } from './shapes.js';
-import { DEFAULT_TRACE_OPTIONS, loadImage, pathsToSvg, traceImage } from './trace.js';
+import {
+  DEFAULT_TRACE_OPTIONS,
+  findBestThreshold,
+  loadImage,
+  pathsToSvg,
+  traceImage,
+} from './trace.js';
 import { GALLERY_ENABLED } from './config.js';
 import {
   hydrate,
@@ -348,12 +354,25 @@ function galleryCard(entry, shape) {
   report.addEventListener('click', async (event) => {
     event.stopPropagation();
     const reason = prompt(t('gallery.reportPrompt')) ?? '';
+    report.disabled = true;
     try {
-      await reportShape(entry.id, reason);
-      alert(t('gallery.reportDone'));
-      card.remove();
+      const result = await reportShape(entry.id, reason);
+      if (result.alreadyReported) {
+        alert(t('gallery.reportDup'));
+        return;
+      }
+      // Only drop the card once the shape is actually hidden. Removing it on
+      // every report made a single report look like an instant deletion.
+      if (result.hidden) {
+        alert(t('gallery.reportHidden'));
+        card.remove();
+      } else {
+        report.textContent = t('gallery.reported');
+        alert(t('gallery.reportDone'));
+      }
     } catch {
-      alert(t('gallery.reportDup'));
+      alert(t('gallery.reportFailed'));
+      report.disabled = false;
     }
   });
 
@@ -663,6 +682,7 @@ function openCustomSheet() {
   $('trace-options').hidden = true;
   $('trace-threshold').value = '0.5';
   $('trace-detail').value = String(DEFAULT_TRACE_OPTIONS.simplify);
+  $('trace-smooth').value = String(DEFAULT_TRACE_OPTIONS.curveError);
   $('trace-invert').checked = false;
   $('publish-group').hidden = !GALLERY_ENABLED;
   $('publish-toggle').checked = false;
@@ -703,6 +723,7 @@ function syncTraceLabels() {
   const threshold = Number($('trace-threshold').value);
   $('trace-threshold-value').textContent = `${Math.round(threshold * 100)}%`;
   $('trace-detail-value').textContent = Number($('trace-detail').value).toFixed(1);
+  $('trace-smooth-value').textContent = Number($('trace-smooth').value).toFixed(1);
 }
 
 function showTracePreview(paths, aspectRatio) {
@@ -757,7 +778,7 @@ function retrace() {
         return;
       }
       showCustomError(null);
-      draft.svg = pathsToSvg(paths, width, height);
+      draft.svg = pathsToSvg(paths, width, height, Number($('trace-smooth').value));
       ({ paths: draft.paths, aspectRatio: draft.aspectRatio } = prepareShapeSource(draft.svg));
       showTracePreview(draft.paths, draft.aspectRatio);
     } catch {
@@ -805,10 +826,25 @@ async function handleFilePicked(file) {
     return;
   }
 
-  // Seed the threshold slider with the automatic choice, then trace.
-  const auto = traceImage(draft.image, { threshold: null });
-  $('trace-threshold').value = String(auto.threshold.toFixed(2));
+  // Search for the threshold that traces this image best, rather than just
+  // taking Otsu's global guess, then seed the slider with it.
   $('trace-options').hidden = false;
+  showCustomError(null);
+  $('trace-count').textContent = t('custom.tracing');
+  $('trace-preview').hidden = false;
+  $('trace-preview').classList.add('is-busy');
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  let best;
+  try {
+    best = findBestThreshold(draft.image, { invert: $('trace-invert').checked });
+  } catch {
+    best = { threshold: 0.5 };
+  } finally {
+    $('trace-preview').classList.remove('is-busy');
+  }
+
+  $('trace-threshold').value = String(best.threshold.toFixed(2));
   syncTraceLabels();
   retrace();
 }
@@ -1045,7 +1081,23 @@ async function init() {
   });
   $('trace-threshold').addEventListener('input', scheduleRetrace);
   $('trace-detail').addEventListener('input', scheduleRetrace);
+  $('trace-smooth').addEventListener('input', scheduleRetrace);
   $('trace-invert').addEventListener('change', scheduleRetrace);
+  $('trace-auto').addEventListener('click', async () => {
+    if (!draft.image) return;
+    const preview = $('trace-preview');
+    preview.classList.add('is-busy');
+    $('trace-count').textContent = t('custom.searching');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    try {
+      const best = findBestThreshold(draft.image, { invert: $('trace-invert').checked });
+      $('trace-threshold').value = String(best.threshold.toFixed(2));
+      syncTraceLabels();
+    } finally {
+      preview.classList.remove('is-busy');
+    }
+    retrace();
+  });
   $('custom-save').addEventListener('click', handleCustomSave);
 
   // Sheets

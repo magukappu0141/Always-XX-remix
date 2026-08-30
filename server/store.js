@@ -6,8 +6,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
-// Hide a shape once this many distinct people report it.
-export const REPORTS_TO_HIDE = 3;
+// Reports needed before a shape is auto-hidden, for a brand new submission.
+export const REPORTS_TO_HIDE = 5;
+
+// Established shapes need proportionally more: one extra report per this many
+// likes. Without it a handful of people could bury anything popular, and
+// hiding is meant to catch obvious abuse, not to settle disputes about taste.
+export const LIKES_PER_EXTRA_REPORT = 5;
+export const MAX_REPORTS_TO_HIDE = 25;
 
 // Refuse new submissions past this, so disk use stays bounded.
 export const MAX_SHAPES = 5000;
@@ -17,6 +23,12 @@ export const MAX_SHAPES = 5000;
 // than with the number of shapes, so it is capped: past this many likers the
 // count still rises but repeat protection degrades to the client's own record.
 export const MAX_TRACKED_LIKERS = 2000;
+
+// How many distinct reports it takes to hide this particular shape.
+export function reportsToHide(shape) {
+  const earned = Math.floor((shape.likes ?? 0) / LIKES_PER_EXTRA_REPORT);
+  return Math.min(MAX_REPORTS_TO_HIDE, REPORTS_TO_HIDE + earned);
+}
 
 // A like is a deliberate vote; a use is incidental. Weight them accordingly.
 function popularity(shape) {
@@ -209,9 +221,16 @@ export class Store {
     }
 
     shape.reports.push({ reporter, reason, at: Date.now() });
-    if (shape.reports.length >= REPORTS_TO_HIDE) shape.hidden = true;
+    const needed = reportsToHide(shape);
+    if (shape.reports.length >= needed) shape.hidden = true;
     await this.save();
-    return { ok: true, alreadyReported: false, hidden: shape.hidden };
+    return {
+      ok: true,
+      alreadyReported: false,
+      hidden: shape.hidden,
+      reports: shape.reports.length,
+      needed,
+    };
   }
 
   listReported() {
@@ -222,6 +241,7 @@ export class Store {
         ...Store.publicView(s),
         hidden: s.hidden,
         reportCount: s.reports.length,
+        reportsNeeded: reportsToHide(s),
         reasons: s.reports.map((r) => r.reason).filter(Boolean),
       }));
   }

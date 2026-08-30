@@ -217,7 +217,11 @@ async function handle(req, res, store) {
     }
     const result = await store.report(reportMatch[1], reason, key);
     return result.ok
-      ? send(res, 200, { ok: true, hidden: result.hidden })
+      ? send(res, 200, {
+          ok: true,
+          hidden: result.hidden,
+          alreadyReported: Boolean(result.alreadyReported),
+        })
       : fail(res, 404, 'not_found', 'shape not found');
   }
 

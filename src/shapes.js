@@ -44,16 +44,46 @@ export const BUILTIN_SHAPES = [
  * Turn SVG source into the normalised form the canvas animates towards.
  * Returns `{ paths, aspectRatio }` where every point is in 0..1.
  */
+// Read the drawing frame from the SVG's own viewBox, if it has a usable one.
+function readViewBox(svgSource) {
+  const match = svgSource.match(/viewBox\s*=\s*["']\s*([-\d.eE]+)[\s,]+([-\d.eE]+)[\s,]+([-\d.eE]+)[\s,]+([-\d.eE]+)/);
+  if (!match) return null;
+  const [minX, minY, width, height] = match.slice(1).map(Number);
+  if (!(width > 0) || !(height > 0)) return null;
+  return { minX, minY, width, height };
+}
+
+/**
+ * Turn SVG source into the normalised form the canvas animates towards.
+ * Returns `{ paths, aspectRatio }` where every point is in 0..1.
+ *
+ * The viewBox is the frame the artwork was drawn in, so it decides the
+ * proportions. Falling back to the ink's own bounding box would reshape an
+ * imported drawing to whatever its strokes happen to span; a square doodle
+ * centred in a wide photo would come back square.
+ */
 export function prepareShapeSource(svgSource) {
   const polylines = sampleSvg(svgSource);
   const all = polylines.flat();
   if (all.length === 0) {
     throw new Error('prepareShapeSource: SVG produced no points');
   }
-  const bounds = getBounds(all);
+
+  const ink = getBounds(all);
+  const viewBox = readViewBox(svgSource);
+  // Ignore a viewBox that does not actually contain the drawing; some files
+  // carry a stale or nominal one.
+  const framed =
+    viewBox &&
+    ink.minX >= viewBox.minX - 1 &&
+    ink.minY >= viewBox.minY - 1 &&
+    ink.minX + ink.width <= viewBox.minX + viewBox.width + 1 &&
+    ink.minY + ink.height <= viewBox.minY + viewBox.height + 1;
+
+  const frame = framed ? viewBox : ink;
   return {
-    paths: polylines.map((line) => normalize(line, bounds)),
-    aspectRatio: bounds.width / bounds.height,
+    paths: polylines.map((line) => normalize(line, frame)),
+    aspectRatio: frame.width / frame.height,
   };
 }
 

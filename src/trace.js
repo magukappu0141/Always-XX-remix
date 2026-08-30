@@ -1,5 +1,7 @@
 // Raster line art to SVG centrelines.
-// threshold -> thin to 1px -> walk the skeleton -> simplify.
+// threshold -> thin to 1px -> walk the skeleton -> simplify -> fit curves.
+
+import { curvesToPathData, fitCurves } from './curvefit.js';
 
 const MAX_DIMENSION = 1000;
 const MIN_PATH_POINTS = 4;
@@ -26,7 +28,27 @@ export const DEFAULT_TRACE_OPTIONS = {
   // Close gaps up to this many pixels across, for lines broken by a light
   // pencil or by threshold noise.
   closeGaps: 1,
+  // Max distance a fitted curve may stray from the traced points, in pixels.
+  // Larger gives fewer, rounder curves.
+  curveError: 2.2,
+  // Long edge the image is scaled to before processing.
+  maxDimension: MAX_DIMENSION,
+  // Give up early when ink coverage is nowhere near plausible line art.
+  // Only the threshold search sets this; thinning a flooded mask is by far
+  // the most expensive thing the pipeline can be asked to do.
+  bailOutsideInkBand: false,
 };
+
+// Threshold search runs many traces, so it works on a small copy: the best
+// cutoff barely moves with resolution, and this keeps the search interactive.
+const SEARCH_DIMENSION = 200;
+
+// Plausible share of the page covered by ink in a line drawing. Outside this
+// band the threshold has either starved the image or flooded it, and the
+// skeleton stops meaning anything.
+const MIN_INK_FRACTION = 0.004;
+const MAX_INK_FRACTION = 0.16;
+const SUBSTANTIAL_PATH = 24;
 
 export async function loadImage(file) {
   const url = URL.createObjectURL(file);
@@ -45,8 +67,8 @@ export async function loadImage(file) {
 }
 
 // Draw the image at a bounded size and return its grayscale samples.
-function toGrayscale(image) {
-  const scale = Math.min(1, MAX_DIMENSION / Math.max(image.width, image.height));
+function toGrayscale(image, maxDimension = MAX_DIMENSION) {
+  const scale = Math.min(1, maxDimension / Math.max(image.width, image.height));
   const width = Math.max(1, Math.round(image.width * scale));
   const height = Math.max(1, Math.round(image.height * scale));
 
@@ -199,19 +221,20 @@ function closeGaps(mask, width, height, radius) {
 function despeckle(mask, width, height, minPixels) {
   if (minPixels <= 0) return mask;
   const seen = new Uint8Array(mask.length);
-  const stack = [];
+  const stack = new Int32Array(mask.length);
+  const blob = new Int32Array(mask.length);
 
   for (let start = 0; start < mask.length; start++) {
     if (!mask[start] || seen[start]) continue;
 
-    stack.length = 0;
-    stack.push(start);
+    let top = 0;
+    let blobSize = 0;
+    stack[top++] = start;
     seen[start] = 1;
-    const blob = [];
 
-    while (stack.length > 0) {
-      const index = stack.pop();
-      blob.push(index);
+    while (top > 0) {
+      const index = stack[--top];
+      blob[blobSize++] = index;
       const x = index % width;
       const y = (index / width) | 0;
       for (const [dx, dy] of NEIGHBOURS) {
@@ -221,13 +244,13 @@ function despeckle(mask, width, height, minPixels) {
         const ni = ny * width + nx;
         if (mask[ni] && !seen[ni]) {
           seen[ni] = 1;
-          stack.push(ni);
+          stack[top++] = ni;
         }
       }
     }
 
-    if (blob.length < minPixels) {
-      for (const index of blob) mask[index] = 0;
+    if (blobSize < minPixels) {
+      for (let i = 0; i < blobSize; i++) mask[blob[i]] = 0;
     }
   }
   return mask;
@@ -333,34 +356,50 @@ function crossingNumber(mask, width, height, index) {
  * touch each other, so removing the pixel cannot break the line.
  */
 function pruneRedundant(mask, width, height) {
-  const adjacent = (a, b) => {
-    const ax = a % width;
-    const ay = (a / width) | 0;
-    const bx = b % width;
-    const by = (b / width) | 0;
-    return Math.abs(ax - bx) <= 1 && Math.abs(ay - by) <= 1;
-  };
+  // Scratch buffers reused across every pixel and pass. This runs over the
+  // whole image repeatedly, so per-pixel allocation dominated the cost.
+  const nx = new Int32Array(8);
+  const ny = new Int32Array(8);
+  const group = new Int32Array(8);
 
   for (;;) {
     let removed = false;
 
     for (let index = 0; index < mask.length; index++) {
       if (!mask[index]) continue;
-      const neighbours = neighbourIndices(mask, width, height, index);
-      if (neighbours.length < 2) continue;
 
-      // Do the neighbours form a single group among themselves?
-      const seen = new Set([neighbours[0]]);
-      const queue = [neighbours[0]];
-      while (queue.length > 0) {
-        const current = queue.pop();
-        for (const other of neighbours) {
-          if (seen.has(other) || !adjacent(current, other)) continue;
-          seen.add(other);
-          queue.push(other);
+      const x = index % width;
+      const y = (index / width) | 0;
+      let count = 0;
+      for (let k = 0; k < 8; k++) {
+        const ax = x + NEIGHBOURS[k][0];
+        const ay = y + NEIGHBOURS[k][1];
+        if (ax < 0 || ay < 0 || ax >= width || ay >= height) continue;
+        if (!mask[ay * width + ax]) continue;
+        nx[count] = ax;
+        ny[count] = ay;
+        count++;
+      }
+      if (count < 2) continue;
+
+      // Do the neighbours already touch each other without this pixel?
+      for (let i = 0; i < count; i++) group[i] = i;
+      const find = (i) => {
+        let root = i;
+        while (group[root] !== root) root = group[root];
+        return root;
+      };
+      for (let i = 0; i < count; i++) {
+        for (let j = i + 1; j < count; j++) {
+          if (Math.abs(nx[i] - nx[j]) > 1 || Math.abs(ny[i] - ny[j]) > 1) continue;
+          const a = find(i);
+          const b = find(j);
+          if (a !== b) group[a] = b;
         }
       }
-      if (seen.size !== neighbours.length) continue;
+      let roots = 0;
+      for (let i = 0; i < count; i++) if (find(i) === i) roots++;
+      if (roots !== 1) continue;
 
       mask[index] = 0;
       removed = true;
@@ -371,10 +410,6 @@ function pruneRedundant(mask, width, height) {
   return mask;
 }
 
-/**
- * Walk the skeleton into polylines: first every branch that starts at an
- * endpoint or junction, then whatever closed loops are left over.
- */
 function traceSkeleton(mask, width, height) {
   const degree = new Uint8Array(width * height);
   const pixels = [];
@@ -476,7 +511,7 @@ export function traceImage(image, options = {}) {
   const opts = { ...DEFAULT_TRACE_OPTIONS, ...options };
   const { simplify, minBranch, invert, adaptive } = opts;
 
-  const { gray, width, height } = toGrayscale(image);
+  const { gray, width, height } = toGrayscale(image, opts.maxDimension);
   const auto = otsuThreshold(gray);
   // `threshold` is a slider position; treat it as an offset from the
   // automatic choice so the control stays useful across very different
@@ -490,6 +525,15 @@ export function traceImage(image, options = {}) {
 
   mask = closeGaps(mask, width, height, opts.closeGaps);
   despeckle(mask, width, height, opts.despeckle);
+
+  let inkPixels = 0;
+  for (let i = 0; i < mask.length; i++) inkPixels += mask[i];
+  const inkFraction = inkPixels / mask.length;
+
+  if (opts.bailOutsideInkBand && (inkFraction < MIN_INK_FRACTION || inkFraction > MAX_INK_FRACTION)) {
+    return { paths: [], width, height, threshold: level, inkFraction };
+  }
+
   thin(mask, width, height);
   pruneRedundant(mask, width, height);
 
@@ -498,7 +542,7 @@ export function traceImage(image, options = {}) {
     .map((line) => simplifyPath(line, simplify))
     .filter((line) => line.length >= 2 && polylineLength(line) >= MIN_PATH_LENGTH);
 
-  return { paths, width, height, threshold: level };
+  return { paths, width, height, threshold: level, inkFraction };
 }
 
 // Thinning leaves short whiskers where a stroke widens or two lines meet.
@@ -521,13 +565,20 @@ function pruneSpurs(paths, minBranch) {
   });
 }
 
-// Serialise traced polylines as an SVG document.
-export function pathsToSvg(paths, width, height) {
+// Serialise traced polylines as an SVG document, fitting curves through them.
+// `curveError` of 0 keeps the raw polyline.
+export function pathsToSvg(paths, width, height, curveError = DEFAULT_TRACE_OPTIONS.curveError) {
   const body = paths
     .map((line) => {
-      const d = line
-        .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(2)} ${p.y.toFixed(2)}`)
-        .join(' ');
+      let d;
+      if (curveError > 0) {
+        d = curvesToPathData(fitCurves(line, curveError));
+      }
+      if (!d) {
+        d = line
+          .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(2)} ${p.y.toFixed(2)}`)
+          .join(' ');
+      }
       return `  <path d="${d}"/>`;
     })
     .join('\n');
@@ -537,10 +588,58 @@ ${body}
 </svg>`;
 }
 
+// Average length of the substantial strokes: clean line art gives a few long
+// paths, while a flooded threshold gives a mesh of short ones.
+function scoreTrace(paths, inkFraction) {
+  if (paths.length === 0) return 0;
+  if (inkFraction < MIN_INK_FRACTION || inkFraction > MAX_INK_FRACTION) return 0;
+  let earned = 0;
+  for (const line of paths) {
+    const len = polylineLength(line);
+    if (len >= SUBSTANTIAL_PATH) earned += len;
+  }
+  return earned / paths.length;
+}
+
+// How much better than Otsu a candidate must score before we move off it.
+// Otsu is a good default; the search is here for the images it gets wrong,
+// not to second-guess it on the ones it gets right.
+const SWITCH_MARGIN = 1.25;
+
+// Search threshold offsets for the one that traces this image best, so the
+// slider starts somewhere usable instead of at a blind guess.
+export function findBestThreshold(image, options = {}) {
+  const base = { ...DEFAULT_TRACE_OPTIONS, ...options, maxDimension: SEARCH_DIMENSION };
+  const { gray } = toGrayscale(image, SEARCH_DIMENSION);
+  const auto = otsuThreshold(gray);
+
+  // Skip curve fitting throughout; only the geometry matters for scoring.
+  const run = (threshold) => {
+    const clamped = Math.min(0.98, Math.max(0.02, threshold));
+    const res = traceImage(image, {
+      ...base,
+      threshold: clamped,
+      curveError: 0,
+      bailOutsideInkBand: true,
+    });
+    return { threshold: clamped, score: scoreTrace(res.paths, res.inkFraction), paths: res.paths.length };
+  };
+
+  const baseline = run(auto);
+  let best = baseline;
+  for (const offset of [-0.18, -0.11, -0.05, 0.05, 0.11, 0.18]) {
+    const candidate = run(auto + offset);
+    if (candidate.score > best.score) best = candidate;
+  }
+
+  return best.score > baseline.score * SWITCH_MARGIN ? best : baseline;
+}
+
 // Convenience: file -> SVG string.
 export async function traceFileToSvg(file, options) {
   const image = await loadImage(file);
-  const { paths, width, height } = traceImage(image, options);
+  const merged = { ...DEFAULT_TRACE_OPTIONS, ...options };
+  const { paths, width, height } = traceImage(image, merged);
   if (paths.length === 0) throw new Error('No strokes found in image');
-  return { svg: pathsToSvg(paths, width, height), paths, width, height };
+  return { svg: pathsToSvg(paths, width, height, merged.curveError), paths, width, height };
 }
