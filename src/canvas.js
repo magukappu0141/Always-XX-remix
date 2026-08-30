@@ -536,6 +536,28 @@ export function createDrawingCanvas(canvas, options = {}) {
     }
   }
 
+  // The true "before" picture: backdrop plus each pending stroke drawn on
+  // its own. buildMorphBatch concatenates same-shape strokes into one
+  // virtual line for the morph math, which bridges the gap between two
+  // separately pen-lifted strokes with a straight connecting segment —
+  // harmless once the animation is moving, but wrong to hold on, since it
+  // shows a stroke that was never actually drawn. This draws each stroke
+  // with its own gap intact instead, matching what the canvas looked like
+  // right before the export started.
+  function drawOriginalFrame(snapCtx, outW, outH, outScale, backdrop, pendingStrokes) {
+    snapCtx.setTransform(1, 0, 0, 1, 0, 0);
+    snapCtx.drawImage(backdrop, 0, 0);
+
+    const dpr = window.devicePixelRatio || 1;
+    const s = outScale * dpr * view.scale;
+    snapCtx.setTransform(s, 0, 0, s, outScale * dpr * view.panX, outScale * dpr * view.panY);
+    snapCtx.lineCap = 'round';
+    snapCtx.lineJoin = 'round';
+    for (const stroke of pendingStrokes) {
+      drawPolylineOn(snapCtx, stroke.points, stroke.color, stroke.width);
+    }
+  }
+
   /**
    * Export the next morph as an animated GIF, and actually perform that
    * morph on the live canvas too — exporting stands in for pressing the
@@ -550,6 +572,8 @@ export function createDrawingCanvas(canvas, options = {}) {
   async function recordMorphGif(fallbackShape) {
     const grouped = groupPendingStrokes(fallbackShape);
     if (!grouped) throw new Error('Nothing to morph');
+    // Snapshot before buildMorphBatch's concatenation, for the opening hold.
+    const originalPending = strokes.filter((s) => !s.morphed);
 
     const batches = grouped.groups.flatMap(({ shape, combined }) => buildMorphBatch(combined, shape));
     if (batches.length === 0) throw new Error('Nothing to morph');
@@ -572,6 +596,10 @@ export function createDrawingCanvas(canvas, options = {}) {
       drawGifFrame(snapCtx, outW, outH, outScale, backdrop, batches, i / stepCount);
       frames.push({ data: snapCtx.getImageData(0, 0, outW, outH).data, delayCs });
     }
+    // The opening hold shows the drawing as it actually was, not
+    // buildMorphBatch's concatenated stand-in for it (see drawOriginalFrame).
+    drawOriginalFrame(snapCtx, outW, outH, outScale, backdrop, originalPending);
+    frames[0] = { data: snapCtx.getImageData(0, 0, outW, outH).data, delayCs };
     // Hold the drawing before it starts moving, and the finished shape after,
     // so both ends read clearly instead of flashing by in one frame.
     frames[0].delayCs += delayCs * (GIF_HOLD_FRAMES - 1);
