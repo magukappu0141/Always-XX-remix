@@ -1,6 +1,6 @@
 // Screen flow, toolbar, settings, and the custom shape creator.
 
-import { canRecordMorph, createDrawingCanvas } from './canvas.js';
+import { createDrawingCanvas } from './canvas.js';
 import {
   LOCALES,
   getLocale,
@@ -990,7 +990,7 @@ async function init() {
     onChange: ({ hasContent, canUndo, canMorph }) => {
       $('tool-undo').disabled = !canUndo;
       $('tool-morph').disabled = !canMorph;
-      if (!$('tool-record').hidden) $('tool-record').disabled = !canMorph;
+      $('tool-record').disabled = !canMorph;
       $('tool-save').disabled = !hasContent;
       $('tool-publish').disabled = !hasContent || !GALLERY_ENABLED;
       $('tool-clear').disabled = !hasContent;
@@ -1041,29 +1041,25 @@ async function init() {
     $('settings-sheet').hidden = false;
   });
   $('tool-morph').addEventListener('click', () => drawing.morphAll(activeShape));
-  if (canRecordMorph()) {
-    $('tool-record').hidden = false;
-    $('tool-record').addEventListener('click', async () => {
-      const btn = $('tool-record');
-      btn.disabled = true;
-      btn.classList.add('is-recording');
-      try {
-        const blob = await drawing.recordMorph(activeShape);
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
-        link.download = `always-xx-${Date.now()}.${ext}`;
-        link.click();
-        URL.revokeObjectURL(url);
-      } catch {
-        alert(t('draw.recordFailed'));
-      } finally {
-        btn.classList.remove('is-recording');
-        btn.disabled = $('tool-morph').disabled;
-      }
-    });
-  }
+  $('tool-record').addEventListener('click', async () => {
+    const btn = $('tool-record');
+    btn.disabled = true;
+    btn.classList.add('is-recording');
+    try {
+      const blob = await drawing.recordMorphGif(activeShape);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `always-xx-${Date.now()}.gif`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      alert(t('draw.recordFailed'));
+    } finally {
+      btn.classList.remove('is-recording');
+      btn.disabled = $('tool-morph').disabled;
+    }
+  });
   $('tool-clear').addEventListener('click', () => {
     if (confirm(t('draw.clearConfirm'))) drawing.clear();
   });

@@ -13,6 +13,7 @@ import {
   smooth,
   splitStroke,
 } from './morph.js';
+import { encodeGif } from './gif.js';
 
 const MAX_UNDO = 50;
 const MIN_SCALE = 0.1;
@@ -25,30 +26,14 @@ const MIN_POINT_DISTANCE = 1.1;
 
 const clampScale = (s) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
 
-// Preference order: vp9 is smaller for the same quality, mp4 is Safari's
-// only option. No dependency pulled in for this — MediaRecorder is native.
-const VIDEO_MIME_CANDIDATES = [
-  'video/webm;codecs=vp9',
-  'video/webm;codecs=vp8',
-  'video/webm',
-  'video/mp4',
-];
-
-export function canRecordMorph() {
-  return (
-    typeof MediaRecorder !== 'undefined' &&
-    typeof HTMLCanvasElement !== 'undefined' &&
-    typeof HTMLCanvasElement.prototype.captureStream === 'function' &&
-    pickVideoMimeType() !== ''
-  );
-}
-
-function pickVideoMimeType() {
-  for (const type of VIDEO_MIME_CANDIDATES) {
-    if (MediaRecorder.isTypeSupported?.(type)) return type;
-  }
-  return '';
-}
+// Long edge of an exported GIF, in pixels. Downscaled well below the live
+// canvas's device-pixel size so encoding stays fast and the file stays
+// small enough to actually share.
+const GIF_MAX_DIMENSION = 480;
+const GIF_FPS = 12;
+// How long to hold the first and last frame, on top of one frame's own
+// interval, so the still shape reads clearly instead of just flashing by.
+const GIF_HOLD_FRAMES = 5;
 
 export function createDrawingCanvas(canvas, options = {}) {
   const {
@@ -226,7 +211,14 @@ export function createDrawingCanvas(canvas, options = {}) {
     }
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Paint an opaque background rather than clearing to transparent. The
+    // page's own background showed through either way for a normal viewer,
+    // but canvas.captureStream() reads this canvas's actual pixels — with a
+    // transparent backdrop, the recorder composited it to black, so a
+    // "recorded" clip came out solid black with the (also black) ink
+    // invisible against it.
+    ctx.fillStyle = getBackground();
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(base, 0, 0);
 
     setWorldTransform(ctx);
@@ -287,8 +279,11 @@ export function createDrawingCanvas(canvas, options = {}) {
     });
   }
 
-  // Queue the animations that turn one stroke into `shape`.
-  function morphStroke(stroke, shape) {
+  // Pure math: the per-piece morphs that turn one (possibly stroke-combined)
+  // drawing into `shape`, with no side effects on live drawing state. Shared
+  // by the live animation path and the GIF exporter, which needs the same
+  // morphs without touching `animations`.
+  function buildMorphBatch(stroke, shape) {
     const fitted = expandBox(getBounds(stroke.points), getMinAspect(), shape.aspectRatio);
     const box = scaleBoxHeight(fitted, getHeightScale());
     // Normalise against the fitted box so the stroke still maps end to end;
@@ -299,62 +294,77 @@ export function createDrawingCanvas(canvas, options = {}) {
     // whichever path is actually nearest it instead.
     const assignment = matchPiecesToPaths(pieces, shape.paths);
 
-    pieces.forEach((piece, i) => {
-      animations.push({
-        morph: buildMorph({
-          sourcePoints: denormalize(piece, fitted),
-          targetPoints: denormalize(shape.paths[assignment[i]], box),
-        }),
-        interp: [],
-        start: performance.now(),
-        color: stroke.color,
-        width: stroke.width,
-        done: false,
-      });
-    });
+    return pieces.map((piece, i) => ({
+      morph: buildMorph({
+        sourcePoints: denormalize(piece, fitted),
+        targetPoints: denormalize(shape.paths[assignment[i]], box),
+      }),
+      color: stroke.color,
+      width: stroke.width,
+    }));
   }
 
-  function morphAll(fallbackShape) {
+  // Queue the animations that turn one stroke into `shape`.
+  function morphStroke(stroke, shape) {
+    for (const { morph, color, width } of buildMorphBatch(stroke, shape)) {
+      animations.push({ morph, interp: [], start: performance.now(), color, width, done: false });
+    }
+  }
+
+  // Group pending strokes by the shape they were drawn under, combining each
+  // group into one virtual stroke. Without this, each stroke morphed alone
+  // into every one of the shape's paths — splitting the outline into one
+  // piece, an eye into another, and so on — which forced drawing the whole
+  // shape as one unbroken line to get a clean result. Combining same-shape
+  // strokes first means the outline, an eye and the mouth can each be their
+  // own pen stroke and still land on the right parts together.
+  //
+  // Returns `{ indices, groups }` — `indices` are the pending strokes'
+  // positions in `strokes` (for the caller to remove), `groups` are
+  // `{ shape, combined }` ready for buildMorphBatch. Returns null if there
+  // is nothing pending.
+  function groupPendingStrokes(fallbackShape) {
     const pending = strokes
       .map((stroke, index) => ({ stroke, index }))
       .filter(({ stroke }) => !stroke.morphed);
-    if (pending.length === 0) return;
+    if (pending.length === 0) return null;
 
-    pushHistory();
-
-    // Group pending strokes by the shape they were drawn under. Without
-    // this, each stroke morphed alone into every one of the shape's paths —
-    // splitting the outline into one piece, an eye into another, and so on
-    // — which forces drawing the whole shape as one unbroken line to get a
-    // clean result. Combining same-shape strokes into a single virtual
-    // stroke first means the outline, an eye and the mouth can each be their
-    // own pen stroke and still land on the right parts together.
-    const groups = new Map();
+    const byShape = new Map();
     for (const { stroke, index } of pending) {
       const shape = stroke.shape ?? fallbackShape;
       if (!shape || !shape.paths || shape.paths.length === 0) continue;
       const key = shape.id ?? shape;
-      if (!groups.has(key)) groups.set(key, { shape, items: [] });
-      groups.get(key).items.push({ stroke, index });
+      if (!byShape.has(key)) byShape.set(key, { shape, items: [] });
+      byShape.get(key).items.push({ stroke, index });
     }
+    if (byShape.size === 0) return null;
 
-    // Remove every grouped stroke before morphing any of them; backwards so
-    // splicing doesn't shift indices still to come.
-    const indices = [...groups.values()]
-      .flatMap(({ items }) => items.map((i) => i.index))
-      .sort((a, b) => b - a);
-    for (const index of indices) strokes.splice(index, 1);
-    if (indices.length > 0) baseDirty = true;
-
-    for (const { shape, items } of groups.values()) {
-      items.sort((a, b) => a.index - b.index); // draw order, not removal order
-      const combined = {
-        points: items.flatMap(({ stroke }) => stroke.points),
-        color: items[items.length - 1].stroke.color,
-        width: items[items.length - 1].stroke.width,
+    const indices = [...byShape.values()].flatMap(({ items }) => items.map((i) => i.index));
+    const groups = [...byShape.values()].map(({ shape, items }) => {
+      items.sort((a, b) => a.index - b.index); // draw order, not insertion order
+      return {
+        shape,
+        combined: {
+          points: items.flatMap(({ stroke }) => stroke.points),
+          color: items[items.length - 1].stroke.color,
+          width: items[items.length - 1].stroke.width,
+        },
       };
-      morphStroke(combined, shape);
-    }
+    });
+    return { indices, groups };
+  }
+
+  function morphAll(fallbackShape) {
+    const grouped = groupPendingStrokes(fallbackShape);
+    if (!grouped) return;
+
+    pushHistory();
+
+    // Backwards so splicing doesn't shift indices still to come.
+    for (const index of [...grouped.indices].sort((a, b) => b - a)) strokes.splice(index, 1);
+    baseDirty = true;
+
+    for (const { shape, combined } of grouped.groups) morphStroke(combined, shape);
 
     emitChange();
     schedule();
@@ -480,63 +490,80 @@ export function createDrawingCanvas(canvas, options = {}) {
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(canvas);
 
-  // Record the next morph as a video clip: start capturing the visible
-  // canvas, trigger morphAll, and stop once every queued animation has
-  // settled. Returns the clip as a Blob.
-  async function recordMorph(fallbackShape, { maxMs = 6000 } = {}) {
-    if (!canRecordMorph()) throw new Error('Video recording is not supported in this browser');
-    const hasPending = strokes.some((s) => !s.morphed);
-    if (!hasPending) throw new Error('Nothing to morph');
+  // Render one animated GIF frame at progress `t` (0..1) onto `snapCtx`,
+  // sized outW x outH — the settled base layer plus every pending batch's
+  // interpolated position at that point in the morph.
+  function drawGifFrame(snapCtx, outW, outH, outScale, batches, t) {
+    snapCtx.setTransform(1, 0, 0, 1, 0, 0);
+    snapCtx.fillStyle = getBackground();
+    snapCtx.fillRect(0, 0, outW, outH);
+    snapCtx.drawImage(base, 0, 0, canvas.width, canvas.height, 0, 0, outW, outH);
 
-    const mimeType = pickVideoMimeType();
-    const stream = canvas.captureStream(30);
-    const recorder = new MediaRecorder(stream, { mimeType });
-    const chunks = [];
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunks.push(event.data);
-    };
+    const dpr = window.devicePixelRatio || 1;
+    const s = outScale * dpr * view.scale;
+    snapCtx.setTransform(s, 0, 0, s, outScale * dpr * view.panX, outScale * dpr * view.panY);
+    snapCtx.lineCap = 'round';
+    snapCtx.lineJoin = 'round';
 
-    const stopped = new Promise((resolve, reject) => {
-      recorder.onstop = () => resolve(new Blob(chunks, { type: recorder.mimeType || mimeType }));
-      recorder.onerror = (event) => reject(event.error ?? new Error('Recording failed'));
-    });
+    for (const { morph, color, width } of batches) {
+      const points = morphAt(morph, morph.easing(t), []);
+      drawPolylineOn(snapCtx, points, color, width);
+    }
+  }
 
-    recorder.start();
-    // Let the recorder actually start emitting before the morph begins, so
-    // the clip doesn't open on a blank frame.
-    await new Promise((resolve) => setTimeout(resolve, 120));
+  /**
+   * Export the next morph as an animated GIF, and actually perform that
+   * morph on the live canvas too — exporting stands in for pressing the
+   * regular morph button, not an extra step alongside it.
+   *
+   * Frames are sampled at fixed points along the morph's own 0..1 progress
+   * rather than captured from real time, so the result doesn't depend on
+   * the browser actually delivering rAF/timer callbacks on schedule — a
+   * backgrounded tab or a slow device can't produce a choppy or truncated
+   * GIF the way it could a live screen recording.
+   */
+  async function recordMorphGif(fallbackShape) {
+    const grouped = groupPendingStrokes(fallbackShape);
+    if (!grouped) throw new Error('Nothing to morph');
+
+    const batches = grouped.groups.flatMap(({ shape, combined }) => buildMorphBatch(combined, shape));
+    if (batches.length === 0) throw new Error('Nothing to morph');
+
+    const outScale = Math.min(1, GIF_MAX_DIMENSION / Math.max(canvas.width, canvas.height));
+    const outW = Math.max(1, Math.round(canvas.width * outScale));
+    const outH = Math.max(1, Math.round(canvas.height * outScale));
+    const snap = document.createElement('canvas');
+    snap.width = outW;
+    snap.height = outH;
+    const snapCtx = snap.getContext('2d', { willReadFrequently: true });
+
+    const durationMs = batches[0].morph.durationMs;
+    const stepCount = Math.max(2, Math.round((durationMs / 1000) * GIF_FPS));
+    const delayCs = Math.max(2, Math.round(100 / GIF_FPS));
+
+    const frames = [];
+    for (let i = 0; i <= stepCount; i++) {
+      drawGifFrame(snapCtx, outW, outH, outScale, batches, i / stepCount);
+      frames.push({ data: snapCtx.getImageData(0, 0, outW, outH).data, delayCs });
+    }
+    // Hold the drawing before it starts moving, and the finished shape after,
+    // so both ends read clearly instead of flashing by in one frame.
+    frames[0].delayCs += delayCs * (GIF_HOLD_FRAMES - 1);
+    frames[frames.length - 1].delayCs += delayCs * (GIF_HOLD_FRAMES - 1);
+
+    const gif = encodeGif({ width: outW, height: outH, frames });
+
+    // The GIF is already fully computed from these exact morphs; now play
+    // the real thing so the canvas ends up in the same place it always does.
     morphAll(fallbackShape);
 
-    // Wait for either the morph to actually settle, or maxMs to run out —
-    // whichever comes first. These must race rather than run independently:
-    // a backgrounded tab (switched away, screen locked) freezes the rAF loop
-    // that drives the morph, so animations.length can stay non-zero forever.
-    // Without the race, a plain "stop after maxMs" would still leave this
-    // function waiting on a settle that can no longer happen.
-    let settled = false;
-    await Promise.race([
-      new Promise((resolve) => {
-        const check = () => {
-          if (settled || animations.length === 0) resolve();
-          else setTimeout(check, 40);
-        };
-        check();
-      }),
-      new Promise((resolve) => setTimeout(resolve, maxMs)),
-    ]);
-    settled = true;
-
-    // Hold the settled frame briefly so the clip doesn't cut off mid-blend.
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    if (recorder.state !== 'inactive') recorder.stop();
-
-    return stopped;
+    return gif;
   }
 
   return {
     resize,
     morphAll,
-    recordMorph,
+    recordMorphGif,
 
     getView: () => ({ ...view }),
     resetView: () => setView({ scale: 1, panX: 0, panY: 0 }),
