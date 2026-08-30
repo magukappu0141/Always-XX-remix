@@ -181,6 +181,69 @@ export function splitStroke(points, k) {
   return out;
 }
 
+function centroid(points) {
+  let sx = 0;
+  let sy = 0;
+  for (const p of points) {
+    sx += p.x;
+    sy += p.y;
+  }
+  return { x: sx / points.length, y: sy / points.length };
+}
+
+/**
+ * Pair each stroke piece with the target path nearest to it, instead of
+ * matching them by index (piece 0 -> path 0, piece 1 -> path 1, ...).
+ *
+ * splitStroke cuts a stroke into equal-length pieces in drawing order, which
+ * has no reason to line up with how the target shape's paths happen to be
+ * ordered in its source SVG. Index-matching them anyway can send a piece
+ * clear across the shape to reach "its" path, which reads as the line
+ * tearing apart mid-morph rather than flowing into place. Nearest-centroid
+ * matching keeps each piece's motion short, so eyes-shaped ink drawn near
+ * the eyes tends to land on the eyes even without deliberate aim.
+ *
+ * `pieces` and `paths` must be the same length, and in the same coordinate
+ * space (both normalised or both denormalised — centroid distance is all
+ * that's compared). Returns an array where `assignment[i]` is the path index
+ * piece `i` should target.
+ */
+export function matchPiecesToPaths(pieces, paths) {
+  const n = pieces.length;
+  const pieceCentroids = pieces.map(centroid);
+  const pathCentroids = paths.map(centroid);
+
+  const assignment = new Array(n).fill(-1);
+  const usedPieces = new Set();
+  const usedPaths = new Set();
+
+  // Greedily take the closest remaining pair, n times. O(n^3), but n is a
+  // shape's path count — always small — so this is effectively instant.
+  for (let step = 0; step < n; step++) {
+    let bestDist = Infinity;
+    let bestI = -1;
+    let bestJ = -1;
+    for (let i = 0; i < n; i++) {
+      if (usedPieces.has(i)) continue;
+      for (let j = 0; j < n; j++) {
+        if (usedPaths.has(j)) continue;
+        const dx = pieceCentroids[i].x - pathCentroids[j].x;
+        const dy = pieceCentroids[i].y - pathCentroids[j].y;
+        const dist = dx * dx + dy * dy;
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestI = i;
+          bestJ = j;
+        }
+      }
+    }
+    assignment[bestI] = bestJ;
+    usedPieces.add(bestI);
+    usedPaths.add(bestJ);
+  }
+  return assignment;
+}
+
 // Laplacian smoothing; `strength` 0..1 maps to 0..10 passes.
 export function smooth(points, strength = 0.5) {
   if (points.length <= 2) return points.slice();

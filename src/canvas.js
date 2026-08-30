@@ -6,6 +6,7 @@ import {
   denormalize,
   expandBox,
   getBounds,
+  matchPiecesToPaths,
   morphAt,
   normalize,
   scaleBoxHeight,
@@ -293,12 +294,16 @@ export function createDrawingCanvas(canvas, options = {}) {
     // Normalise against the fitted box so the stroke still maps end to end;
     // only the target box is stretched.
     const pieces = splitStroke(normalize(stroke.points, fitted), shape.paths.length);
+    // Pieces come out in drawing order, which has no reason to match the
+    // order the shape's paths happen to be defined in — pair each piece with
+    // whichever path is actually nearest it instead.
+    const assignment = matchPiecesToPaths(pieces, shape.paths);
 
     pieces.forEach((piece, i) => {
       animations.push({
         morph: buildMorph({
           sourcePoints: denormalize(piece, fitted),
-          targetPoints: denormalize(shape.paths[i], box),
+          targetPoints: denormalize(shape.paths[assignment[i]], box),
         }),
         interp: [],
         start: performance.now(),
@@ -316,16 +321,41 @@ export function createDrawingCanvas(canvas, options = {}) {
     if (pending.length === 0) return;
 
     pushHistory();
-    // Backwards so splicing does not shift indices still to come.
-    for (const { stroke, index } of pending.reverse()) {
-      // Strokes drawn before this feature existed (or restored from an old
-      // save) have no shape of their own; fall back to whatever is current.
+
+    // Group pending strokes by the shape they were drawn under. Without
+    // this, each stroke morphed alone into every one of the shape's paths —
+    // splitting the outline into one piece, an eye into another, and so on
+    // — which forces drawing the whole shape as one unbroken line to get a
+    // clean result. Combining same-shape strokes into a single virtual
+    // stroke first means the outline, an eye and the mouth can each be their
+    // own pen stroke and still land on the right parts together.
+    const groups = new Map();
+    for (const { stroke, index } of pending) {
       const shape = stroke.shape ?? fallbackShape;
-      if (!shape || shape.paths.length === 0) continue;
-      strokes.splice(index, 1);
-      baseDirty = true;
-      morphStroke(stroke, shape);
+      if (!shape || !shape.paths || shape.paths.length === 0) continue;
+      const key = shape.id ?? shape;
+      if (!groups.has(key)) groups.set(key, { shape, items: [] });
+      groups.get(key).items.push({ stroke, index });
     }
+
+    // Remove every grouped stroke before morphing any of them; backwards so
+    // splicing doesn't shift indices still to come.
+    const indices = [...groups.values()]
+      .flatMap(({ items }) => items.map((i) => i.index))
+      .sort((a, b) => b - a);
+    for (const index of indices) strokes.splice(index, 1);
+    if (indices.length > 0) baseDirty = true;
+
+    for (const { shape, items } of groups.values()) {
+      items.sort((a, b) => a.index - b.index); // draw order, not removal order
+      const combined = {
+        points: items.flatMap(({ stroke }) => stroke.points),
+        color: items[items.length - 1].stroke.color,
+        width: items[items.length - 1].stroke.width,
+      };
+      morphStroke(combined, shape);
+    }
+
     emitChange();
     schedule();
   }
