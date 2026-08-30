@@ -890,3 +890,38 @@ input[type="color"] {
   border-color: var(--color-clear-ink);
   background: var(--color-clear-bg);
 }
+
+/* Usage bar on gallery cards */
+
+.gallery-card__uses {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+
+.gallery-card__uses-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-border);
+  overflow: hidden;
+}
+
+.gallery-card__uses-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--color-primary);
+  transition: width 0.2s ease;
+}
+
+.gallery-card__uses-count {
+  flex: none;
+  min-width: 1.4em;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-ink-soft);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}

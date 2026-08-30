@@ -283,6 +283,9 @@ function actionCard(labelKey, iconPath, onClick) {
 let gallerySort = 'new';
 let galleryOffset = 0;
 let galleryLoading = false;
+// Running max `uses` across loaded pages, so the usage bars stay comparable
+// as more shapes are appended via "load more".
+let galleryMaxUses = 0;
 
 function setGalleryStatus(key) {
   const el = $('gallery-status');
@@ -311,6 +314,28 @@ function galleryCard(entry, shape) {
   const meta = document.createElement('span');
   meta.className = 'gallery-card__meta';
   meta.textContent = t('gallery.by', { author: entry.author });
+
+  // How often this shape has been drawn with, shown as a small bar relative
+  // to the most-used shape on the current page — a glance at the row tells
+  // you which ones are actually getting picked, not just which has a bigger
+  // number.
+  const usesRow = document.createElement('span');
+  usesRow.className = 'gallery-card__uses';
+  usesRow.title = t('gallery.uses', { count: entry.uses ?? 0 });
+
+  const usesBar = document.createElement('span');
+  usesBar.className = 'gallery-card__uses-bar';
+  const usesBarFill = document.createElement('span');
+  usesBarFill.className = 'gallery-card__uses-fill';
+  const fraction = galleryMaxUses > 0 ? (entry.uses ?? 0) / galleryMaxUses : 0;
+  usesBarFill.style.width = `${Math.round(Math.max(fraction > 0 ? 0.06 : 0, fraction) * 100)}%`;
+  usesBar.appendChild(usesBarFill);
+
+  const usesCount = document.createElement('span');
+  usesCount.className = 'gallery-card__uses-count';
+  usesCount.textContent = String(entry.uses ?? 0);
+
+  usesRow.append(usesBar, usesCount);
 
   // Likes live in their own control so tapping one doesn't pick the shape.
   let liked = Boolean(entry.liked);
@@ -376,7 +401,7 @@ function galleryCard(entry, shape) {
     }
   });
 
-  card.append(report, art, name, meta, like);
+  card.append(report, art, name, meta, usesRow, like);
   card.addEventListener('click', () => {
     activeShape = shape;
     recordUse(entry.id);
@@ -395,12 +420,14 @@ async function loadGalleryPage(append = false) {
   if (!append) {
     list.textContent = '';
     galleryOffset = 0;
+    galleryMaxUses = 0;
   }
   setGalleryStatus('gallery.loading');
 
   try {
     const page = await listShapes({ sort: gallerySort, limit: GALLERY_PAGE, offset: galleryOffset });
     galleryOffset += page.shapes.length;
+    for (const entry of page.shapes) galleryMaxUses = Math.max(galleryMaxUses, entry.uses ?? 0);
 
     // Artwork is fetched per shape; skip any that fail rather than losing the page.
     const settled = await Promise.allSettled(page.shapes.map(hydrate));
